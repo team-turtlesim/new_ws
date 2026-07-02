@@ -1,0 +1,23 @@
+# Camera configuration
+USB_CAM: true
+MIPI_CAM: false
+USB_CAM_DEVICE: /dev/video1
+IMAGE_WIDTH: 320
+IMAGE_HEIGHT: 160
+ROI_TOP: 50
+ROI_LEFT: 0
+
+# Vehicle control parameters
+STEER_TRIM: 0.10000000000000003
+
+# Web server configuration
+WEB_HOST: 172.30.1.30
+WEB_PORT: 5000
+BATTERY_TOPIC: /battery_status
+IMAGE_TOPIC: /camera/image/compressed
+CONTROL_TOPIC: /control
+JOYSTICK_TOPIC: /joystick
+STORAGE_PATH: /
+IMAGE_DISPLAY_WIDTH: 640
+IMAGE_DISPLAY_HEIGHT: 480
+OPENCV_DEBUG_MODE : true

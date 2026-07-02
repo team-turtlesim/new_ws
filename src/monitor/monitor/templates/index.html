@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  </head>
+  <body>
+    <main class="dashboard">
+      <section class="hero">
+        <div class="hero__content">
+          <p class="hero__eyebrow">Autonomous Driving Platform</p>
+          <div class="hero__title-row">
+            <h1 class="hero__title">D-Racer DASHBOARD</h1>
+            <span class="record-badge" id="record-badge" aria-live="polite">
+              <span class="record-badge__dot" aria-hidden="true"></span>
+              <span id="record-badge-label">REC OFF</span>
+            </span>
+          </div>
+        </div>
+        <div class="hero__media">
+          <img class="hero__partner-logo hero__partner-logo--telechips" src="{{ telechips_logo_url }}" alt="Telechips logo">
+          <img class="hero__partner-logo hero__partner-logo--topst" src="{{ topst_logo_url }}" alt="TOPST logo">
+        </div>
+      </section>
+
+      <section class="status-grid">
+        <article class="status-card image-card is-waiting" id="image-card">
+          <div class="status-card__header">
+            <div>
+              <p class="status-card__label">Image Status</p>
+              <p class="status-card__subtitle">실시간 카메라 스트림</p>
+            </div>
+            <span class="status-chip" id="image-chip">WAITING</span>
+          </div>
+
+          <div class="image-stage">
+            <img
+              id="camera-frame"
+              class="image-stage__frame"
+              src="{{ placeholder_url }}"
+              alt="Camera stream preview"
+            >
+          </div>
+
+          <dl class="status-meta">
+            <div class="status-meta__row">
+              <dt>Topic</dt>
+              <dd>{{ image_topic }}</dd>
+            </div>
+            <div class="status-meta__row">
+              <dt>Frame</dt>
+              <dd id="image-resolution">Waiting for frame</dd>
+            </div>
+            <div class="status-meta__row">
+              <dt>Updated</dt>
+              <dd id="image-updated">Waiting for message</dd>
+            </div>
+          </dl>
+
+          {% if debug_image %}
+          <div class="debug-grid" id="debug-grid">
+            <article class="debug-panel">
+              <p class="debug-panel__title">Grayscale</p>
+              <img id="debug-frame-grayscale" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Grayscale preview">
+              <p class="debug-panel__topic">{{ opencv_grayscale_topic }}</p>
+            </article>
+            <article class="debug-panel">
+              <p class="debug-panel__title">Blur</p>
+              <img id="debug-frame-blur" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Blur preview">
+              <p class="debug-panel__topic">{{ opencv_blur_topic }}</p>
+            </article>
+            <article class="debug-panel">
+              <p class="debug-panel__title">Edge</p>
+              <img id="debug-frame-edge" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Edge preview">
+              <p class="debug-panel__topic">{{ opencv_edge_topic }}</p>
+            </article>
+          </div>
+          {% endif %}
+        </article>
+
+        <article class="status-card battery-card is-waiting" id="battery-card">
+          <div class="status-card__header">
+            <div>
+              <p class="status-card__label">Battery Status</p>
+              <p class="status-card__subtitle">실시간 배터리 잔량</p>
+            </div>
+            <span class="status-chip" id="battery-chip">WAITING</span>
+          </div>
+
+          <div class="battery-reading">
+            <p class="battery-reading__value" id="battery-value">--.-%</p>
+            <div class="battery-meter" aria-hidden="true">
+              <div class="battery-meter__fill" id="battery-meter-fill"></div>
+            </div>
+          </div>
+
+          <dl class="status-meta">
+            <div class="status-meta__row">
+              <dt>Topic</dt>
+              <dd>{{ battery_topic }}</dd>
+            </div>
+            <div class="status-meta__row">
+              <dt>Updated</dt>
+              <dd id="battery-updated">Waiting for message</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article class="status-card control-card is-waiting" id="control-card">
+          <div class="status-card__header">
+            <div>
+              <p class="status-card__label">Control Status</p>
+              <p class="status-card__subtitle">실시간 제어 값</p>
+            </div>
+            <span class="status-chip" id="control-chip">WAITING</span>
+          </div>
+
+          <div class="control-stack">
+            <section class="control-row">
+              <p class="control-row__name">Throttle</p>
+              <div class="control-row__body">
+                <div class="control-bar is-neutral" id="throttle-bar">
+                  <div class="control-bar__baseline"></div>
+                  <div class="control-bar__fill" id="throttle-bar-fill"></div>
+                </div>
+                <p class="control-row__value" id="throttle-value">--.--</p>
+              </div>
+            </section>
+
+            <section class="control-row">
+              <p class="control-row__name">Steering</p>
+              <div class="control-row__body">
+                <div class="control-bar is-neutral" id="steering-bar">
+                  <div class="control-bar__baseline"></div>
+                  <div class="control-bar__fill" id="steering-bar-fill"></div>
+                </div>
+                <p class="control-row__value" id="steering-value">--.--</p>
+              </div>
+            </section>
+          </div>
+
+          <dl class="status-meta">
+            <div class="status-meta__row">
+              <dt>Topic</dt>
+              <dd>{{ control_topic }}</dd>
+            </div>
+            <div class="status-meta__row">
+              <dt>Updated</dt>
+              <dd id="control-updated">Waiting for message</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article class="status-card storage-card is-waiting" id="storage-card">
+          <div class="status-card__header">
+            <div>
+              <p class="status-card__label">Storage Status</p>
+              <p class="status-card__subtitle">실시간 저장장치 점유율</p>
+            </div>
+            <span class="status-chip" id="storage-chip">WAITING</span>
+          </div>
+
+          <div class="storage-reading">
+            <p class="storage-reading__value" id="storage-value">--.-%</p>
+            <div class="battery-meter storage-meter" aria-hidden="true">
+              <div class="battery-meter__fill" id="storage-meter-fill"></div>
+            </div>
+            <p class="storage-reading__detail" id="storage-detail">-- / -- used</p>
+          </div>
+
+          <dl class="status-meta">
+            <div class="status-meta__row">
+              <dt>Path</dt>
+              <dd>{{ storage_path }}</dd>
+            </div>
+            <div class="status-meta__row">
+              <dt>Updated</dt>
+              <dd id="storage-updated">Waiting for update</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article class="status-card graph-card is-waiting" id="graph-card">
+          <div class="status-card__header">
+            <div>
+              <p class="status-card__label">ROS Graph</p>
+              <p class="status-card__subtitle">실시간 노드/토픽 연결</p>
+            </div>
+            <span class="status-chip" id="graph-chip">WAITING</span>
+          </div>
+
+          <div class="ros-graph" id="ros-graph-canvas" aria-live="polite"></div>
+
+          <dl class="status-meta">
+            <div class="status-meta__row">
+              <dt>Updated</dt>
+              <dd id="graph-updated">Waiting for graph</dd>
+            </div>
+            <div class="status-meta__row">
+              <dt>Entities</dt>
+              <dd id="graph-summary">0 nodes / 0 edges</dd>
+            </div>
+          </dl>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      window.MONITOR_CONFIG = {
+        statusEndpoint: {{ url_for('api_status')|tojson }},
+        graphEndpoint: {{ url_for('api_graph')|tojson }},
+        frameEndpoint: {{ url_for('api_frame')|tojson }},
+        debugFrameGrayscaleEndpoint: {{ url_for('api_frame_grayscale')|tojson }},
+        debugFrameBlurEndpoint: {{ url_for('api_frame_blur')|tojson }},
+        debugFrameEdgeEndpoint: {{ url_for('api_frame_edge')|tojson }},
+        debugImageEnabled: {{ debug_image|tojson }},
+        placeholderUrl: {{ placeholder_url|tojson }},
+        refreshIntervalMs: {{ refresh_interval_ms|tojson }},
+        imageRefreshIntervalMs: {{ image_refresh_interval_ms|tojson }}
+      };
+    </script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>
