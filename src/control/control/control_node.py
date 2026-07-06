@@ -29,6 +29,10 @@ class ControlNode(Node):
         self.declare_parameter('vehicle_config_file', get_default_vehicle_config_path())
         self.declare_parameter('control_topic', '/control')
         self.declare_parameter('command_hz', 10.0)
+        # stale 워치독: interpret(제어결정)은 이벤트구동이라 카메라/인지 파이프라인이
+        # 멈추면 /control 발행이 끊긴다. 이 시간(초) 넘게 새 명령이 없으면 조향을
+        # 중립(steer_trim)으로 되돌리고 스로틀 0 으로 페일세이프한다.
+        self.declare_parameter('command_timeout_sec', 0.5)
 
         i2c_bus = int(self.get_parameter('i2c_bus').value)
         pca9685_addr = int(self.get_parameter('pca9685_addr').value)
@@ -43,6 +47,7 @@ class ControlNode(Node):
             raise ValueError('command_hz must be greater than 0')
 
         self.command_hz = command_hz
+        self.command_timeout_sec = float(self.get_parameter('command_timeout_sec').value)
         self.steer_trim = self.load_steer_trim()
 
         self.d3_racer = D3Racer(
@@ -61,12 +66,14 @@ class ControlNode(Node):
             f'  steer_trim={self.steer_trim}\n'
             f'  control_topic={control_topic}\n'
             f'  command_hz={self.command_hz}\n'
+            f'  command_timeout_sec={self.command_timeout_sec}\n'
             f'  vehicle_config_file={self.vehicle_config_file}'
         )
 
         self.throttle = 0.0
         self.steering = self.steer_trim
         self.e_stop_active = False
+        self.last_cmd_time = None  # 마지막 /control 수신 시각(stale 워치독용)
 
         # Control inputs
         self.create_subscription(
@@ -84,13 +91,29 @@ class ControlNode(Node):
             self.apply_actuation(self.steering, 0.0)
             return
 
+        # stale 워치독: 명령이 한 번도 안 왔거나 timeout 초과 -> 중립+정지.
+        if self.command_is_stale():
+            self.apply_actuation(self.steer_trim, 0.0)
+            self.get_logger().warning(
+                'No /control command (stale). Neutral steer + stop.',
+                throttle_duration_sec=1.0,
+            )
+            return
+
         self.apply_actuation(self.steering, self.throttle)
+
+    def command_is_stale(self):
+        if self.last_cmd_time is None:
+            return True
+        age = (self.get_clock().now() - self.last_cmd_time).nanoseconds * 1e-9
+        return age > self.command_timeout_sec
 
     def apply_actuation(self, steering, throttle):
         self.d3_racer.set_steering_percent(float(steering))
         self.d3_racer.set_throttle_percent(float(throttle))
 
     def control_callback(self, msg: Control):
+        self.last_cmd_time = self.get_clock().now()
         if self.e_stop_active:
             return
 
