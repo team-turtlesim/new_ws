@@ -45,6 +45,19 @@ class LaneDetectionNode(Node):
         self.declare_parameter('edge_topic', '/opencv/image/edge')
         self.declare_parameter('detection_topic', '/lane/detection')
         self.declare_parameter('debug_topic', '/lane_detection/image/debug')
+        # --- 갈림길(중앙 노란 지름길) 추종 --------------------------------
+        # opencv_node 가 분리 발행하는 노란색 전용 마스크. ROI 안에 노란 픽셀이
+        # 충분히 보이면 '갈림길에 진입했다'고 보고 흰 차선 대신 노란 지름길을 추종한다.
+        self.declare_parameter('yellow_topic', '/opencv/image/yellow')
+        self.declare_parameter('follow_yellow_branch', True)
+        # 진입/이탈 임계값(ROI 내 노란 픽셀 수). 히스테리시스로 채터링 방지.
+        # enter > exit 로 둘 것. 트랙/해상도에 맞춰 시뮬에서 튜닝.
+        self.declare_parameter('yellow_enter_pixels', 120)
+        self.declare_parameter('yellow_exit_pixels', 40)
+        # 진입/이탈을 몇 프레임 연속 만족해야 상태를 바꾸는지(디바운스).
+        self.declare_parameter('branch_debounce_frames', 2)
+        # 지름길 추종 시 노란선을 신뢰할 최소 검출 줄 수.
+        self.declare_parameter('yellow_min_rows', 3)
         self.declare_parameter('vehicle_config_file', get_default_vehicle_config_path())
         self.declare_parameter('num_scan_rows', 12)     # ROI 안에서 스캔할 가로줄 개수
         self.declare_parameter('min_detect_rows', 3)    # 차선으로 인정할 최소 검출 줄 수
@@ -62,6 +75,7 @@ class LaneDetectionNode(Node):
         self.declare_parameter('debug_log', False)  # lane_width/검출상태 진단 로그
 
         edge_topic = str(self.get_parameter('edge_topic').value)
+        yellow_topic = str(self.get_parameter('yellow_topic').value)
         detection_topic = str(self.get_parameter('detection_topic').value)
         debug_topic = str(self.get_parameter('debug_topic').value)
         self.vehicle_config_file = os.path.expanduser(
@@ -104,6 +118,11 @@ class LaneDetectionNode(Node):
         # 한쪽만 보일 때 반대편 차선 위치를 추정하는 데 쓴다. (시간 평활 아님)
         self.lane_width_px = None
 
+        # --- 갈림길 상태 ----------------------------------------------------
+        self.latest_yellow = None      # 최신 노란색 마스크(ndarray, grayscale)
+        self.on_branch = False         # 현재 노란 지름길을 추종 중인가
+        self.branch_counter = 0        # 진입/이탈 디바운스 카운터
+
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -115,6 +134,14 @@ class LaneDetectionNode(Node):
             CompressedImage,
             edge_topic,
             self.image_callback,
+            image_qos,
+        )
+        # 노란색 마스크 구독(갈림길 추종용). 최신 프레임만 들고 있다가 edge 콜백에서
+        # 함께 쓴다. 두 스트림은 같은 원본에서 나와 사실상 동기라 근사동기로 충분.
+        self.yellow_sub = self.create_subscription(
+            CompressedImage,
+            yellow_topic,
+            self.yellow_callback,
             image_qos,
         )
         self.detection_pub = self.create_publisher(LaneDetection, detection_topic, 10)
@@ -156,6 +183,106 @@ class LaneDetectionNode(Node):
         if edge is None:
             self.get_logger().warning('Failed to decode edge image')
         return edge
+
+    def yellow_callback(self, msg: CompressedImage):
+        """노란색 마스크 프레임을 받아 최신본만 보관한다(디코드해서 저장)."""
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        yellow = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+        if yellow is not None:
+            self.latest_yellow = yellow
+
+    # ---------------------------------------------------------------- branch
+    def roi_bounds(self, height, width):
+        """현재 파라미터 기준 ROI 상단/좌측 픽셀 경계를 clamp 해서 반환."""
+        roi_top = min(max(int(self.get_parameter('roi_top').value), 0), height - 1)
+        roi_left = min(max(int(self.get_parameter('roi_left').value), 0), width - 1)
+        return roi_top, roi_left
+
+    def update_branch_state(self, yellow, edge_shape):
+        """ROI 안의 노란 픽셀 수로 갈림길 진입/이탈을 히스테리시스+디바운스로 판정.
+        노란 지름길을 추종해야 하면 True 를 반환한다."""
+        if not bool(self.get_parameter('follow_yellow_branch').value):
+            return False
+        if yellow is None or yellow.shape != edge_shape:
+            # 노란 마스크가 없거나 크기가 다르면(예: edge 모드) 갈림길 판단 불가.
+            self.on_branch = False
+            self.branch_counter = 0
+            return False
+
+        height, width = edge_shape
+        roi_top, roi_left = self.roi_bounds(height, width)
+        ycount = int(np.count_nonzero(yellow[roi_top:, roi_left:]))
+
+        enter = int(self.get_parameter('yellow_enter_pixels').value)
+        exit_thresh = int(self.get_parameter('yellow_exit_pixels').value)
+        need = max(1, int(self.get_parameter('branch_debounce_frames').value))
+
+        if not self.on_branch:
+            # 진입: 노란 픽셀이 enter 이상인 프레임이 need 번 연속되면 지름길 진입.
+            self.branch_counter = self.branch_counter + 1 if ycount >= enter else 0
+            if self.branch_counter >= need:
+                self.on_branch = True
+                self.branch_counter = 0
+        else:
+            # 이탈: 노란 픽셀이 exit 이하인 프레임이 need 번 연속되면 흰 차선 복귀.
+            self.branch_counter = self.branch_counter + 1 if ycount <= exit_thresh else 0
+            if self.branch_counter >= need:
+                self.on_branch = False
+                self.branch_counter = 0
+        return self.on_branch
+
+    def detect_yellow_line(self, yellow):
+        """노란 지름길 선을 '중심선'으로 보고 그 위를 따라가도록 offset/heading 을
+        계산한다(단일 가이드선 추종). 행별 노란 픽셀의 중앙 x 를 이어 진행선을 만든다.
+        노란선이 부족하면 None 을 반환(호출부에서 흰 차선으로 폴백)."""
+        height, width = yellow.shape
+        center_x = width / 2.0
+        roi_top, roi_left = self.roi_bounds(height, width)
+        scan_ys = np.linspace(roi_top, height - 1, self.num_scan_rows).astype(int)
+
+        pts = []  # (y, center_x_of_yellow)
+        for y in scan_ys:
+            xs = np.where(yellow[int(y), roi_left:] > 0)[0]
+            if xs.size == 0:
+                continue
+            xs = xs + roi_left
+            pts.append((int(y), float(np.median(xs))))
+
+        min_rows = max(2, int(self.get_parameter('yellow_min_rows').value))
+        if len(pts) < min_rows:
+            return None
+
+        pts.sort()  # y 오름차순(상단 먼저)
+        lane_center = float(np.median([x for _, x in pts]))
+        raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
+
+        # heading: ROI 상단↔하단 중심 x 를 잇는 기울기(전진 기준 우측 휨 = 양수).
+        (y_top, x_top), (y_bot, x_bot) = pts[0], pts[-1]
+        if y_bot > y_top:
+            slope = (x_bot - x_top) / (y_bot - y_top)
+            raw_heading = math.atan2(-slope, 1.0)
+        else:
+            raw_heading = 0.0
+
+        confidence = len(pts) / float(self.num_scan_rows)
+        line_pts = [(int(y), int(x)) for y, x in pts]
+        return {
+            'raw_offset': raw_offset,
+            'raw_heading': raw_heading,
+            # 지름길 추종 중엔 '검출됨'으로 표시해 interpret 가 offset 을 그대로 쓰게 한다
+            # (양쪽 True -> 단독선 처리 안 함). 실제 흰 좌/우 차선 의미는 아님.
+            'left_detected': True,
+            'right_detected': True,
+            'confidence': float(np.clip(confidence, 0.0, 1.0)),
+            'lane_center': lane_center,
+            'center_x': center_x,
+            'image_width': int(width),
+            'image_height': int(height),
+            'left_pts': line_pts,   # 디버그 시각화용(노란선 점)
+            'right_pts': [],
+            'left_poly': None,
+            'right_poly': None,
+        }
 
     # --------------------------------------------------------------- detection
     def detect_lane(self, edge):
@@ -455,11 +582,22 @@ class LaneDetectionNode(Node):
         if edge is None:
             return
 
-        result = self.detect_lane(edge)
+        # 갈림길 판단: ROI 안에 노란 지름길이 충분히 보이면 그쪽을 추종한다.
+        yellow = self.latest_yellow
+        if self.update_branch_state(yellow, edge.shape):
+            result = self.detect_yellow_line(yellow)
+            if result is None:
+                # 노란선을 잃음 -> 흰 차선으로 폴백하고 상태도 내린다.
+                self.on_branch = False
+                self.branch_counter = 0
+                result = self.detect_lane(edge)
+        else:
+            result = self.detect_lane(edge)
 
         if bool(self.get_parameter('debug_log').value):
             lc = result['lane_center']
             self.get_logger().info(
+                f"branch={int(self.on_branch)} "
                 f"lane_width_px={self.lane_width_px:.0f} "
                 f"L={int(result['left_detected'])} R={int(result['right_detected'])} "
                 f"lane_center={('%.0f' % lc) if lc is not None else 'None'} "
