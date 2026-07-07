@@ -60,6 +60,10 @@ class MonitorNode(Node):
         self.declare_parameter('opencv_grayscale_topic', '/opencv/image/grayscale')
         self.declare_parameter('opencv_blur_topic', '/opencv/image/blur')
         self.declare_parameter('opencv_edge_topic', '/opencv/image/edge')
+        self.declare_parameter('yolo_debug_topic', '/yolo/image/debug')
+        self.declare_parameter('yolo_debug', False)  # YOLO 오버레이 패널 표시 여부
+        self.declare_parameter('aruco_debug_topic', '/aruco/image/debug')
+        self.declare_parameter('aruco_debug', False)  # ArUco 오버레이 패널 표시 여부
         self.declare_parameter('control_topic', '/control')
         self.declare_parameter('storage_path', '/')
         self.declare_parameter('storage_poll_interval_sec', 1.0)
@@ -87,6 +91,10 @@ class MonitorNode(Node):
         self.opencv_grayscale_topic = self.get_yaml_or_param_str(yaml_config, 'OPENCV_GRAYSCALE_TOPIC', 'opencv_grayscale_topic')
         self.opencv_blur_topic = self.get_yaml_or_param_str(yaml_config, 'OPENCV_BLUR_TOPIC', 'opencv_blur_topic')
         self.opencv_edge_topic = self.get_yaml_or_param_str(yaml_config, 'OPENCV_EDGE_TOPIC', 'opencv_edge_topic')
+        self.yolo_debug_topic = self.get_yaml_or_param_str(yaml_config, 'YOLO_DEBUG_TOPIC', 'yolo_debug_topic')
+        self.yolo_debug = bool(self.get_parameter('yolo_debug').value)
+        self.aruco_debug_topic = self.get_yaml_or_param_str(yaml_config, 'ARUCO_DEBUG_TOPIC', 'aruco_debug_topic')
+        self.aruco_debug = bool(self.get_parameter('aruco_debug').value)
         if not self.control_topic:
             # Backward compatibility for legacy typo key.
             self.control_topic = str(yaml_config.get('CONTORL_TOPIC', '')).strip()
@@ -153,6 +161,10 @@ class MonitorNode(Node):
             self.opencv_grayscale_topic,
             self.opencv_blur_topic,
             self.opencv_edge_topic,
+            yolo_debug=self.yolo_debug,
+            yolo_debug_topic=self.yolo_debug_topic,
+            aruco_debug=self.aruco_debug,
+            aruco_debug_topic=self.aruco_debug_topic,
             graph_snapshot_provider=self.get_graph_snapshot,
         )
         self.server_thread = FlaskServerThread(self.app, self.web_host, self.web_port)
@@ -188,6 +200,20 @@ class MonitorNode(Node):
                 self.debug_edge_callback,
                 10,
             )
+            if self.yolo_debug:
+                self.create_subscription(
+                    CompressedImage,
+                    self.yolo_debug_topic,
+                    self.debug_yolo_callback,
+                    10,
+                )
+            if self.aruco_debug:
+                self.create_subscription(
+                    CompressedImage,
+                    self.aruco_debug_topic,
+                    self.debug_aruco_callback,
+                    10,
+                )
         self.create_subscription(
             Control,
             self.control_topic,
@@ -308,6 +334,12 @@ class MonitorNode(Node):
 
     def debug_edge_callback(self, msg):
         self._debug_image_callback(msg, 'edge', self.opencv_edge_topic)
+
+    def debug_yolo_callback(self, msg):
+        self._debug_image_callback(msg, 'yolo', self.yolo_debug_topic)
+
+    def debug_aruco_callback(self, msg):
+        self._debug_image_callback(msg, 'aruco', self.aruco_debug_topic)
 
     def storage_timer_callback(self):
         try:

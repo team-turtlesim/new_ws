@@ -19,9 +19,15 @@ then:
 control_node 에는 stale 워치독이 있어, interpret(이벤트구동)이 프레임 끊김으로
 발행을 멈추면 자동으로 조향 중립 + 정지한다.
 
+Add `yolo:=true` to ALSO start yolo_node (객체검출). 검출은 대시보드 YOLO 패널에
+표시되지만, interpret 는 yolo_enabled=false 라 제어(정지/감속)엔 관여하지 않는다.
+검증 후 `ros2 param set /interpret_node yolo_enabled true` 로 제어 연동을 켠다.
+
 Usage:
     ros2 launch control racer_bringup.launch.py                 # web + perception + judgment
     ros2 launch control racer_bringup.launch.py drive:=true     # + actuator
+    ros2 launch control racer_bringup.launch.py yolo:=true      # + object detection (표시만)
+    ros2 launch control racer_bringup.launch.py aruco:=true     # + ArUco 마커 검출 (표시만)
     ros2 launch control racer_bringup.launch.py debug_overlay:=false  # raw edge pane
 """
 
@@ -32,6 +38,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def get_vehicle_config_path():
@@ -73,6 +80,8 @@ def generate_launch_description():
 
     drive = LaunchConfiguration('drive')
     debug_overlay = LaunchConfiguration('debug_overlay')
+    yolo = LaunchConfiguration('yolo')
+    aruco = LaunchConfiguration('aruco')
 
     # monitor "edge" pane topic: lane overlay when debug_overlay, else raw edge.
     edge_topic = PythonExpression([
@@ -88,6 +97,20 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'debug_overlay', default_value='true',
             description='Point the monitor edge pane at the lane debug overlay.',
+        ),
+        DeclareLaunchArgument(
+            'yolo', default_value='false',
+            description='Also start yolo_node (object detection) + show its overlay '
+                        'pane on the dashboard. interpret 는 yolo_enabled=false 라 '
+                        '검출을 표시만 하고 제어(정지/감속)엔 관여하지 않는다 — 검증 후 '
+                        'ros2 param set /interpret_node yolo_enabled true 로 켠다.',
+        ),
+        DeclareLaunchArgument(
+            'aruco', default_value='false',
+            description='Also start aruco_node (ArUco 마커 검출) + show its overlay '
+                        'pane on the dashboard. /detected_marker_id + /aruco_stop 를 '
+                        '발행하지만 지금은 어떤 노드도 구독하지 않아 주행엔 영향 없다 '
+                        '(interpret 연동은 추후).',
         ),
 
         # --- Perception + judgment/control-law + web (always) ---
@@ -106,7 +129,25 @@ def generate_launch_description():
              output='screen'),
         Node(package='monitor', executable='monitor_node', name='monitor_node',
              output='screen',
-             parameters=[cfg, {'opencv_edge_topic': edge_topic}]),
+             parameters=[cfg, {
+                 'opencv_edge_topic': edge_topic,
+                 # yolo:=true / aruco:=true 일 때만 대시보드에 해당 오버레이 패널 표시.
+                 'yolo_debug': ParameterValue(yolo, value_type=bool),
+                 'aruco_debug': ParameterValue(aruco, value_type=bool),
+             }]),
+
+        # --- Object detection (only with yolo:=true) ---
+        # 카메라 원본(/camera/image/compressed)을 직접 구독하는 독립 인지 브랜치.
+        # 검출을 /yolo/detections + /yolo/image/debug 로 발행. 모델이 없으면 빈 검출만
+        # 내보내며 죽지 않는다(models/README.md 참고).
+        Node(package='yolo', executable='yolo_node', name='yolo_node',
+             output='screen', condition=IfCondition(yolo)),
+
+        # --- ArUco marker detection (only with aruco:=true) ---
+        # 카메라 원본을 직접 구독하는 독립 인지 브랜치. /detected_marker_id + /aruco_stop
+        # + /aruco/image/debug 발행. 현재 구독자 없어 주행 무영향(추후 interpret 연동).
+        Node(package='aruco', executable='aruco_node', name='aruco_node',
+             output='screen', condition=IfCondition(aruco)),
 
         # --- Actuator driver (only with drive:=true) ---
         Node(package='control', executable='control_node', name='control_node',

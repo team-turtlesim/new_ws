@@ -1,0 +1,7 @@
+# YOLO 클래스 라벨 — 한 줄에 클래스 하나, class_id 0 부터 순서대로.
+# '#' 주석줄과 빈 줄은 무시된다.
+# 프로젝트 커스텀 클래스 (yolo26n 파인튜닝): {0:green_light, 1:left_sign, 2:red_light, 3:right_sign}
+green_light
+left_sign
+red_light
+right_sign

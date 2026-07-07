@@ -38,7 +38,8 @@ import rclpy
 from rclpy.node import Node
 import yaml
 
-from interface.msg import Control, LaneDetection, LaneInfo
+from interface.msg import Control, DetectionArray, LaneDetection, LaneInfo
+from std_msgs.msg import Bool
 
 
 def get_default_vehicle_config_path():
@@ -133,6 +134,40 @@ class InterpretNode(Node):
         self.declare_parameter('min_confidence', 0.2)   # 미만 -> lost 취급
         self.declare_parameter('debug_log', False)
 
+        # --- YOLO 검출 연동(정지/감속) -------------------------------------
+        # 기본 비활성(yolo_enabled=False): 켜기 전엔 /yolo/detections 를 구독만 하고
+        # 스로틀에 전혀 관여하지 않아 기존 주행 동작이 100% 그대로다. 검증 후
+        #   ros2 param set /interpret_node yolo_enabled true
+        # 로 켠다. 조향은 건드리지 않는다(차선추종 유지) — 스로틀만 게이팅.
+        self.declare_parameter('yolo_enabled', False)
+        self.declare_parameter('yolo_detections_topic', '/yolo/detections')
+        self.declare_parameter('yolo_min_confidence', 0.5)   # 미만 검출은 무시
+        # 박스가 이미지의 이 비율 이상일 때만 반응(근접 프록시). 멀리 있는 작은 검출 무시.
+        self.declare_parameter('yolo_min_box_area_ratio', 0.03)
+        # 정지/감속시킬 클래스 (labels.txt 이름과 정확히 일치해야 함). 라이브 튜닝 가능.
+        # 이 프로젝트 클래스 {green_light,left_sign,red_light,right_sign} 기준 기본 매핑:
+        #   red_light -> 정지.  green_light -> 통과(어느 목록에도 없음).
+        #   left_sign/right_sign -> 표시만(조향 영역이라 정지/감속엔 미연동).
+        self.declare_parameter('yolo_stop_labels', ['red_light'])
+        # 감속 전용 클래스는 없음. ['']=사실상 빈 목록(어떤 라벨과도 불일치). 필요시 추가.
+        self.declare_parameter('yolo_slow_labels', [''])
+        self.declare_parameter('yolo_slow_scale', 0.5)       # 감속 시 throttle 배율
+        # 검출 끊김(노드 사망 등) 이 시간 초과면 게이팅 해제 — 죽은 인지가 브레이크를
+        # 영구히 잡지 않도록. 실제 모션 페일세이프는 control_node stale 워치독이 담당.
+        self.declare_parameter('yolo_stop_timeout_sec', 1.0)
+
+        # --- ArUco 마커 연동(정지) -----------------------------------------
+        # aruco_node 의 /aruco_stop(Bool, 이미 디바운스됨)을 구독해 True 면 정지시킨다.
+        # 마커→정지의 '무엇을 정지대상으로 볼지'(target_marker_id) 는 aruco_node 가 판정하고,
+        # interpret 은 그 신호를 받아 '그래서 스로틀을 0으로' = 판단의 나머지를 담당한다.
+        # 조향엔 관여 안 함(차선추종 유지). 기본 활성(사용자 요청). off 하려면:
+        #   ros2 param set /interpret_node aruco_enabled false
+        self.declare_parameter('aruco_enabled', True)
+        self.declare_parameter('aruco_stop_topic', '/aruco_stop')
+        # 정지신호 끊김(노드 사망 등) 이 시간 초과면 게이팅 해제 — 죽은 인지가 브레이크를
+        # 영구히 잡지 않도록.
+        self.declare_parameter('aruco_stop_timeout_sec', 1.0)
+
         detection_topic = str(self.get_parameter('detection_topic').value)
         lane_topic = str(self.get_parameter('lane_topic').value)
         control_topic = str(self.get_parameter('control_topic').value)
@@ -156,6 +191,17 @@ class InterpretNode(Node):
         self.was_low_conf = False       # 직전 프레임 신뢰도 미달?
         self.integral = 0.0             # offset 오차 적분(I 항)
 
+        # --- YOLO 연동 상태(라벨/임계값 등은 콜백에서 매번 param 재읽기 → 라이브 튜닝) ---
+        self.yolo_enabled = bool(self.get_parameter('yolo_enabled').value)
+        self.yolo_stop = False          # 최근 프레임에 정지대상 검출?
+        self.yolo_slow = False          # 최근 프레임에 감속대상 검출?
+        self.last_yolo_time = None      # 마지막 /yolo/detections 수신 시각(stale 판정)
+
+        # --- ArUco 연동 상태 ---
+        self.aruco_enabled = bool(self.get_parameter('aruco_enabled').value)
+        self.aruco_stop = False         # 최근 /aruco_stop 값 (True=정지)
+        self.last_aruco_time = None     # 마지막 /aruco_stop 수신 시각(stale 판정)
+
         self.subscription = self.create_subscription(
             LaneDetection,
             detection_topic,
@@ -164,6 +210,22 @@ class InterpretNode(Node):
         )
         self.lane_pub = self.create_publisher(LaneInfo, lane_topic, 10)
         self.control_pub = self.create_publisher(Control, control_topic, 10)
+
+        # YOLO 검출 구독(정지/감속 게이팅용). 항상 구독하되 gate 는 yolo_enabled 로 제어.
+        self.yolo_sub = self.create_subscription(
+            DetectionArray,
+            str(self.get_parameter('yolo_detections_topic').value),
+            self.yolo_callback,
+            10,
+        )
+
+        # ArUco 정지신호 구독(정지 게이팅용). 항상 구독하되 gate 는 aruco_enabled 로 제어.
+        self.aruco_sub = self.create_subscription(
+            Bool,
+            str(self.get_parameter('aruco_stop_topic').value),
+            self.aruco_callback,
+            10,
+        )
 
         self.get_logger().info(
             'interpret node started (judgment + control law, offset-only):\n'
@@ -292,6 +354,10 @@ class InterpretNode(Node):
         throttle_scale = lerp(1.0, curve_thr_scale, w)
         target_throttle = 0.0 if low_conf else clip(cruise * throttle_scale, 0.0, max_throttle)
 
+        # 인지 게이팅(YOLO 정지/감속 + ArUco 정지): 정지신호면 목표 0. 기존 slew 가 이
+        # 목표까지 부드럽게 램프하므로 급정거가 아니라 완만 감속이 된다(조향은 그대로 유지).
+        target_throttle = self.apply_perception_gate(target_throttle)
+
         step = slew * dt
         if target_throttle > self.throttle_cmd:
             self.throttle_cmd = min(self.throttle_cmd + step, target_throttle)
@@ -301,10 +367,14 @@ class InterpretNode(Node):
         self.publish_control(steering, self.throttle_cmd)
 
         if bool(self.get_parameter('debug_log').value):
+            yolo_tag = ''
+            if self.yolo_enabled:
+                yolo_tag = ' yolo=' + ('STOP' if self.yolo_stop else 'slow' if self.yolo_slow else '-')
+            aruco_tag = ' aruco=STOP' if (self.aruco_enabled and self.aruco_stop) else ''
             self.get_logger().info(
                 f'off={offset:+.3f} i={i_term:+.3f} d={d_offset:+.3f} '
                 f'conf={confidence:.2f} w={w:.2f} kp={kp:.2f} '
-                f'-> steer={steering:+.3f} thr={self.throttle_cmd:.3f}'
+                f'-> steer={steering:+.3f} thr={self.throttle_cmd:.3f}{yolo_tag}{aruco_tag}'
             )
 
     def publish_control(self, steering, throttle):
@@ -313,6 +383,73 @@ class InterpretNode(Node):
         msg.steering = float(steering)
         msg.throttle = float(throttle)
         self.control_pub.publish(msg)
+
+    # ------------------------------------------------------------------ yolo
+    def yolo_callback(self, msg: DetectionArray):
+        """YOLO 검출을 받아 정지/감속 플래그를 갱신. 임계값·라벨은 매번 param 을 다시
+        읽어 라이브 튜닝을 허용한다(다른 노드들과 동일 관례). yolo_enabled=False 면 즉시
+        플래그를 내려 스로틀에 영향을 주지 않는다."""
+        self.last_yolo_time = self.get_clock().now()
+        self.yolo_enabled = bool(self.get_parameter('yolo_enabled').value)
+        if not self.yolo_enabled:
+            self.yolo_stop = False
+            self.yolo_slow = False
+            return
+
+        min_conf = float(self.get_parameter('yolo_min_confidence').value)
+        min_area = float(self.get_parameter('yolo_min_box_area_ratio').value)
+        stop_labels = set(self.get_parameter('yolo_stop_labels').value)
+        slow_labels = set(self.get_parameter('yolo_slow_labels').value)
+        img_area = float(max(1, int(msg.image_width) * int(msg.image_height)))
+
+        stop = False
+        slow = False
+        for d in msg.detections:
+            if float(d.confidence) < min_conf:
+                continue
+            # 박스 면적비 = 근접 프록시. 작은(먼) 검출은 무시해 조기·오반응 방지.
+            if (float(d.width) * float(d.height)) / img_area < min_area:
+                continue
+            if d.label in stop_labels:
+                stop = True
+            elif d.label in slow_labels:
+                slow = True
+        self.yolo_stop = stop
+        self.yolo_slow = slow
+
+    def aruco_callback(self, msg: Bool):
+        """aruco_node 의 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신.
+        aruco_enabled=False 면 즉시 내려 스로틀에 영향을 주지 않는다."""
+        self.last_aruco_time = self.get_clock().now()
+        self.aruco_enabled = bool(self.get_parameter('aruco_enabled').value)
+        self.aruco_stop = bool(msg.data) if self.aruco_enabled else False
+
+    def apply_perception_gate(self, target_throttle):
+        """YOLO/ArUco 인지 기반 스로틀 게이팅(판단). 정지신호가 하나라도 있으면 0,
+        아니면 YOLO 감속만 배율 적용. 각 소스는 stale(노드 사망 등)이면 무시한다
+        (죽은 인지가 브레이크를 영구히 잡지 않게). 조향엔 관여하지 않는다."""
+        now = self.get_clock().now()
+        stop = False
+        slow = False
+        # YOLO: 정지 또는 감속
+        if self.yolo_enabled and self.last_yolo_time is not None:
+            age = (now - self.last_yolo_time).nanoseconds * 1e-9
+            if age <= float(self.get_parameter('yolo_stop_timeout_sec').value):
+                if self.yolo_stop:
+                    stop = True
+                elif self.yolo_slow:
+                    slow = True
+        # ArUco: 정지만
+        if self.aruco_enabled and self.last_aruco_time is not None:
+            age = (now - self.last_aruco_time).nanoseconds * 1e-9
+            if age <= float(self.get_parameter('aruco_stop_timeout_sec').value):
+                if self.aruco_stop:
+                    stop = True
+        if stop:                       # 정지가 최우선
+            return 0.0
+        if slow:
+            return target_throttle * float(self.get_parameter('yolo_slow_scale').value)
+        return target_throttle
 
     # ------------------------------------------------------------------ config
     def load_steer_trim(self):

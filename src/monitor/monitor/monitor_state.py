@@ -21,26 +21,36 @@ class MonitorState:
             'grayscale': None,
             'blur': None,
             'edge': None,
+            'yolo': None,
+            'aruco': None,
         }
         self._debug_widths = {
             'grayscale': image_source_width,
             'blur': image_source_width,
             'edge': image_source_width,
+            'yolo': image_source_width,
+            'aruco': image_source_width,
         }
         self._debug_heights = {
             'grayscale': image_source_height,
             'blur': image_source_height,
             'edge': image_source_height,
+            'yolo': image_source_height,
+            'aruco': image_source_height,
         }
         self._debug_updated_at = {
             'grayscale': None,
             'blur': None,
             'edge': None,
+            'yolo': None,
+            'aruco': None,
         }
         self._debug_updated_monotonic = {
             'grayscale': None,
             'blur': None,
             'edge': None,
+            'yolo': None,
+            'aruco': None,
         }
 
         self._throttle = None
@@ -173,7 +183,7 @@ class MonitorState:
             and storage_total_bytes is not None
         )
         debug_image = {}
-        for key in ('grayscale', 'blur', 'edge'):
+        for key in ('grayscale', 'blur', 'edge', 'yolo', 'aruco'):
             updated_at = debug_updated_at[key]
             debug_image[key] = {
                 'has_data': updated_at is not None,

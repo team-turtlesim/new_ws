@@ -263,7 +263,19 @@ code {
   grid-template-columns: 1fr;
 }
 
-.debug-panel--edge .debug-panel__frame {
+/* Edge + YOLO 두 패널: 2열로 나란히 표시 */
+.debug-grid--double {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* Edge + YOLO + ArUco 세 패널: 3열로 표시 */
+.debug-grid--triple {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.debug-panel--edge .debug-panel__frame,
+.debug-panel--yolo .debug-panel__frame,
+.debug-panel--aruco .debug-panel__frame {
   max-height: 60vh;
   object-fit: contain;
   margin: 0 auto;

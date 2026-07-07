@@ -39,7 +39,11 @@ def create_app( state, page_title,
                 header_logo_path, telechips_logo_path, topst_logo_path, 
                 image_display_width, image_display_height,
                 debug_image, opencv_grayscale_topic, opencv_blur_topic,
-                opencv_edge_topic, graph_snapshot_provider=None ):
+                opencv_edge_topic, yolo_debug=False,
+                yolo_debug_topic='/yolo/image/debug',
+                aruco_debug=False,
+                aruco_debug_topic='/aruco/image/debug',
+                graph_snapshot_provider=None ):
     
     app = Flask( __name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR),)
     app.json.sort_keys = False
@@ -63,6 +67,10 @@ def create_app( state, page_title,
             opencv_grayscale_topic=opencv_grayscale_topic,
             opencv_blur_topic=opencv_blur_topic,
             opencv_edge_topic=opencv_edge_topic,
+            yolo_debug=yolo_debug,
+            yolo_debug_topic=yolo_debug_topic,
+            aruco_debug=aruco_debug,
+            aruco_debug_topic=aruco_debug_topic,
         )
 
     @app.get('/api/status')
@@ -135,6 +143,38 @@ def create_app( state, page_title,
             return Response(
                 build_camera_placeholder_svg(
                     image_display_width, image_display_height, opencv_edge_topic
+                ),
+                mimetype='image/svg+xml',
+            )
+
+        response = Response(frame_bytes, mimetype='image/jpeg')
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        return response
+
+    @app.get('/api/frame/yolo')
+    def api_frame_yolo():
+        frame_bytes = state.get_debug_frame('yolo')
+        if frame_bytes is None:
+            return Response(
+                build_camera_placeholder_svg(
+                    image_display_width, image_display_height, yolo_debug_topic
+                ),
+                mimetype='image/svg+xml',
+            )
+
+        response = Response(frame_bytes, mimetype='image/jpeg')
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        return response
+
+    @app.get('/api/frame/aruco')
+    def api_frame_aruco():
+        frame_bytes = state.get_debug_frame('aruco')
+        if frame_bytes is None:
+            return Response(
+                build_camera_placeholder_svg(
+                    image_display_width, image_display_height, aruco_debug_topic
                 ),
                 mimetype='image/svg+xml',
             )

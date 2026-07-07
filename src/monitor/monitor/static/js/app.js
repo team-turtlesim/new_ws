@@ -25,6 +25,8 @@ const config = window.MONITOR_CONFIG || {
   debugFrameGrayscaleEndpoint: '/api/frame/grayscale',
   debugFrameBlurEndpoint: '/api/frame/blur',
   debugFrameEdgeEndpoint: '/api/frame/edge',
+  debugFrameYoloEndpoint: '/api/frame/yolo',
+  debugFrameArucoEndpoint: '/api/frame/aruco',
   debugImageEnabled: false,
   placeholderUrl: '/api/frame/placeholder',
   refreshIntervalMs: 1000,
@@ -45,6 +47,8 @@ const elements = {
   debugFrameGrayscale: document.getElementById('debug-frame-grayscale'),
   debugFrameBlur: document.getElementById('debug-frame-blur'),
   debugFrameEdge: document.getElementById('debug-frame-edge'),
+  debugFrameYolo: document.getElementById('debug-frame-yolo'),
+  debugFrameAruco: document.getElementById('debug-frame-aruco'),
   recordBadge: document.getElementById('record-badge'),
   recordBadgeLabel: document.getElementById('record-badge-label'),
   controlCard: document.getElementById('control-card'),
@@ -554,6 +558,8 @@ function refreshDebugFrames() {
   refreshImageByEndpoint(elements.debugFrameGrayscale, config.debugFrameGrayscaleEndpoint);
   refreshImageByEndpoint(elements.debugFrameBlur, config.debugFrameBlurEndpoint);
   refreshImageByEndpoint(elements.debugFrameEdge, config.debugFrameEdgeEndpoint);
+  refreshImageByEndpoint(elements.debugFrameYolo, config.debugFrameYoloEndpoint);
+  refreshImageByEndpoint(elements.debugFrameAruco, config.debugFrameArucoEndpoint);
   debugImageRequestInFlight = false;
 }
 

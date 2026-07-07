@@ -13,3 +13,9 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+
+# 모델 가중치 (바이너리 — 별도 배포). labels.txt/README 는 추적.
+*.onnx
+*.pt
+*.engine
+
