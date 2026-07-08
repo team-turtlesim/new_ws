@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sim_bridge</name>
+  <version>0.0.0</version>
+  <description>가제보 시뮬과 실차(new_ws) 파이프라인 연결용 브리지 노드.
+    image_bridge: /camera/image_raw(raw Image) 에서 camera/image/compressed(JPEG) 로.
+    cmd_bridge: /control(interface/Control) 에서 /cmd_vel(geometry_msgs/Twist) 로.
+    실차 코드는 수정하지 않고 토픽/형식 차이만 흡수한다.</description>
+  <maintainer email="smsdvos@gmail.com">mingu</maintainer>
+  <license>TODO: License declaration</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>interface</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
