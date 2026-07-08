@@ -84,6 +84,14 @@ class Judgment:
         self.aruco_enabled = bool(node.get_parameter('aruco_enabled').value)
         self.aruco_stop = False
         self.last_aruco_time = None
+        # 신호등 상태 래치: 빨간불→정지(True), 초록불→출발(False). 초기값 출발.
+        # (순간 게이트가 아니라 '상태' — 초록불을 봐야 출발, 그전엔 계속 정지)
+        self.traffic_light_enabled = bool(node.get_parameter('traffic_light_enabled').value)
+        self.traffic_stop = False
+        # 방향표지 바이어스 상태(Y자 갈래 선택): sign_dir +1/-1/0 래치, 근접 마지막 시각.
+        self.sign_bias_enabled = bool(node.get_parameter('sign_bias_enabled').value)
+        self.sign_dir = 0
+        self.last_sign_near_time = None
 
     # --- 시간필터 ---
     def filter_offset(self, raw_offset, detected, single_line):
@@ -116,13 +124,24 @@ class Judgment:
         min_area = float(gp('yolo_min_box_area_ratio').value)
         stop_labels = set(gp('yolo_stop_labels').value)
         slow_labels = set(gp('yolo_slow_labels').value)
+        self.traffic_light_enabled = bool(gp('traffic_light_enabled').value)
+        red_label = str(gp('red_label').value)
+        green_label = str(gp('green_label').value)
         img_area = float(max(1, int(msg.image_width) * int(msg.image_height)))
         stop = False
         slow = False
+        saw_red = False
+        saw_green = False
         for d in msg.detections:
             if float(d.confidence) < min_conf:
                 continue
-            # 박스 면적비 = 근접 프록시. 작은(먼) 검출은 무시해 조기·오반응 방지.
+            # 신호등(red/green)은 '상태'라 거리 무관하게 판정 — 근접(면적) 게이트 미적용.
+            # (초록불이 작게 잡혀도 출발이 풀려야 하므로 면적 게이트에 걸리면 안 됨.)
+            if d.label == red_label:
+                saw_red = True
+            elif d.label == green_label:
+                saw_green = True
+            # 일반 정지/감속(사람 등)은 근접(면적) 게이트 적용 — 멀리서 조기반응 방지.
             if (float(d.width) * float(d.height)) / img_area < min_area:
                 continue
             if d.label in stop_labels:
@@ -131,6 +150,33 @@ class Judgment:
                 slow = True
         self.yolo_stop = stop
         self.yolo_slow = slow
+        # 신호등 래치: 빨간불 보이면 정지, 초록불 보이면 출발, 둘 다 안 보이면 마지막 상태
+        # 유지. red 가 green 보다 우선(애매하면 안전하게 정지).
+        if self.traffic_light_enabled:
+            if saw_red:
+                self.traffic_stop = True
+            elif saw_green:
+                self.traffic_stop = False
+
+        # 방향표지 near-gate + 래치: left/right 표지판이 '가까우면'(박스 높이비 ≥ 문턱)
+        # 그 방향으로 래치하고 근접 시각 갱신(hold 해제 타이머용). 멀면 무시(미리 안 꺾게).
+        self.sign_bias_enabled = bool(gp('sign_bias_enabled').value)
+        if self.sign_bias_enabled:
+            near_ratio = float(gp('sign_near_ratio').value)
+            left_label = str(gp('left_sign_label').value)
+            right_label = str(gp('right_sign_label').value)
+            img_h = float(max(1, int(msg.image_height)))
+            for d in msg.detections:
+                if float(d.confidence) < min_conf:
+                    continue
+                if (float(d.height) / img_h) < near_ratio:   # near-gate: 가까울 때만
+                    continue
+                if d.label == left_label:
+                    self.sign_dir = 1
+                    self.last_sign_near_time = self.node.get_clock().now()
+                elif d.label == right_label:
+                    self.sign_dir = -1
+                    self.last_sign_near_time = self.node.get_clock().now()
 
     def on_aruco(self, msg):
         """aruco_node 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신."""
@@ -153,6 +199,9 @@ class Judgment:
                     stop = True
                 elif self.yolo_slow:
                     slow = True
+                # 신호등 정지 래치(빨간불 상태)도 반영 — 정지가 우선
+                if self.traffic_light_enabled and self.traffic_stop:
+                    stop = True
         if self.aruco_enabled and self.last_aruco_time is not None:
             age = (now - self.last_aruco_time).nanoseconds * 1e-9
             if age <= float(gp('aruco_stop_timeout_sec').value):
@@ -160,13 +209,30 @@ class Judgment:
                     stop = True
         return stop, slow
 
+    def lane_bias(self):
+        """방향표지 바이어스(Y자 갈래 선택). 근접 표지가 hold 시간 내면 그 방향 유지,
+        지나면(hold 초과) 0 복귀. 반환: 목표 offset 에 줄 치우침(0=중앙유지)."""
+        gp = self.node.get_parameter
+        if (not self.sign_bias_enabled or self.sign_dir == 0
+                or self.last_sign_near_time is None):
+            return 0.0
+        age = (self.node.get_clock().now() - self.last_sign_near_time).nanoseconds * 1e-9
+        if age > float(gp('sign_bias_hold_sec').value):
+            self.sign_dir = 0   # 갈림길 통과 완료 -> 해제
+            return 0.0
+        return float(self.sign_dir) * float(gp('sign_bias_magnitude').value)
+
     def debug_tag(self):
         """디버그 로그 접미사(원본과 동일 포맷)."""
         tag = ''
         if self.yolo_enabled:
             tag += ' yolo=' + ('STOP' if self.yolo_stop else 'slow' if self.yolo_slow else '-')
+            if self.traffic_light_enabled:
+                tag += ' signal=' + ('RED(stop)' if self.traffic_stop else 'GREEN(go)')
         if self.aruco_enabled and self.aruco_stop:
             tag += ' aruco=STOP'
+        if self.sign_bias_enabled and self.sign_dir != 0:
+            tag += ' sign=' + ('LEFT' if self.sign_dir > 0 else 'RIGHT')
         return tag
 
 
@@ -185,8 +251,10 @@ class Controller:
         self.was_low_conf = False                  # 직전 프레임 신뢰도 미달?
         self.integral = 0.0                        # offset 오차 적분(I 항)
 
-    def step(self, offset, confidence, stop, slow):
-        """offset PID + 스로틀 목표(정지/감속 반영) + 슬루 -> (steering, throttle, diag)."""
+    def step(self, offset, confidence, stop, slow, bias=0.0):
+        """offset PID + 스로틀 목표(정지/감속 반영) + 슬루 -> (steering, throttle, diag).
+        bias: 방향표지 바이어스(목표 offset 치우침; 0=중앙유지). P/I 오차에만 반영,
+        미분(D)은 원 offset 기준(setpoint 변화에 미분 튐 방지)."""
         gp = self.node.get_parameter
         now = self.node.get_clock().now()
         if self.prev_time is None:
@@ -216,7 +284,7 @@ class Controller:
         w = smoothstep(abs(offset), sched_off_lo, sched_off_hi)
         kp = lerp(kp_straight, kp_curve, w)
 
-        error = offset  # 목표 = 차선중앙(offset=0)
+        error = offset - bias  # 목표=차선중앙(0); 방향표지 bias 로 좌/우 치우침
 
         # 미분(클램프); 검출 복귀 프레임엔 리셋해 슬램 방지.
         if self.was_low_conf and not low_conf:
@@ -331,27 +399,38 @@ class InterpretNode(Node):
         self.declare_parameter('min_confidence', 0.2)   # 미만 -> lost 취급
         self.declare_parameter('debug_log', False)
 
-        # --- YOLO 검출 연동(정지/감속) -------------------------------------
-        # 기본 비활성(yolo_enabled=False): 켜기 전엔 /yolo/detections 를 구독만 하고
-        # 스로틀에 전혀 관여하지 않아 기존 주행 동작이 100% 그대로다. 검증 후
-        #   ros2 param set /interpret_node yolo_enabled true
-        # 로 켠다. 조향은 건드리지 않는다(차선추종 유지) — 스로틀만 게이팅.
-        self.declare_parameter('yolo_enabled', False)
+        # --- YOLO 검출 연동 -------------------------------------------------
+        # yolo_enabled = /yolo/detections 를 판단에 쓸지 마스터 스위치. True 면 아래가
+        # 모두 동작: 신호등 정지/출발(traffic_light) · 방향표지 바이어스(sign_bias) ·
+        # 일반 정지/감속(yolo_stop_labels, 기본 빈 목록). 모델 검증 완료라 기본 True.
+        # 검출을 '표시만' 하고 제어에서 완전히 떼려면:
+        #   ros2 param set /interpret_node yolo_enabled false
+        # (yolo:=true 로 노드는 띄웠지만 제어 연동만 끄고 싶을 때)
+        self.declare_parameter('yolo_enabled', True)
         self.declare_parameter('yolo_detections_topic', '/yolo/detections')
         self.declare_parameter('yolo_min_confidence', 0.5)   # 미만 검출은 무시
         # 박스가 이미지의 이 비율 이상일 때만 반응(근접 프록시). 멀리 있는 작은 검출 무시.
         self.declare_parameter('yolo_min_box_area_ratio', 0.03)
-        # 정지/감속시킬 클래스 (labels.txt 이름과 정확히 일치해야 함). 라이브 튜닝 가능.
-        # 이 프로젝트 클래스 {green_light,left_sign,red_light,right_sign} 기준 기본 매핑:
-        #   red_light -> 정지.  green_light -> 통과(어느 목록에도 없음).
-        #   left_sign/right_sign -> 표시만(조향 영역이라 정지/감속엔 미연동).
-        self.declare_parameter('yolo_stop_labels', ['red_light'])
+        # 일반 정지/감속 클래스 (labels.txt 이름과 정확히 일치). 라이브 튜닝 가능.
+        # 신호등(red_light/green_light)은 아래 '신호등 래치'가 상태로 처리하므로 여기선
+        # 뺀다(기본 빈 목록). left_sign/right_sign 은 표시만(조향 영역, 미연동).
+        # 다른 즉시정지 클래스(사람 등)를 추가하려면 여기에 넣으면 순간 정지로 동작.
+        self.declare_parameter('yolo_stop_labels', [''])
         # 감속 전용 클래스는 없음. ['']=사실상 빈 목록(어떤 라벨과도 불일치). 필요시 추가.
         self.declare_parameter('yolo_slow_labels', [''])
         self.declare_parameter('yolo_slow_scale', 0.5)       # 감속 시 throttle 배율
         # 검출 끊김(노드 사망 등) 이 시간 초과면 게이팅 해제 — 죽은 인지가 브레이크를
         # 영구히 잡지 않도록. 실제 모션 페일세이프는 control_node stale 워치독이 담당.
         self.declare_parameter('yolo_stop_timeout_sec', 1.0)
+
+        # --- 신호등 상태 래치 (빨간불 정지 / 초록불 출발) ---
+        # 순간 게이트가 아니라 '상태'로 처리: 빨간불(red_label)을 보면 정지로 래치,
+        # 초록불(green_label)을 보면 출발로 해제. 둘 다 안 보이면 마지막 상태 유지 →
+        # 빨간불이 잠깐 가려져도(각도/가림) 초록불을 볼 때까지 계속 정지(안전).
+        # 라벨은 yolo_min_confidence / yolo_min_box_area_ratio 문턱을 공유한다.
+        self.declare_parameter('traffic_light_enabled', True)
+        self.declare_parameter('red_label', 'red_light')
+        self.declare_parameter('green_label', 'green_light')
 
         # --- ArUco 마커 연동(정지) -----------------------------------------
         # aruco_node 의 /aruco_stop(Bool, 이미 디바운스됨)을 구독해 True 면 정지시킨다.
@@ -364,6 +443,19 @@ class InterpretNode(Node):
         # 정지신호 끊김(노드 사망 등) 이 시간 초과면 게이팅 해제 — 죽은 인지가 브레이크를
         # 영구히 잡지 않도록.
         self.declare_parameter('aruco_stop_timeout_sec', 1.0)
+
+        # --- 방향표지(left/right) 바이어스: Y자 갈림길에서 좌/우 갈래 선택 ---
+        # left/right 표지판이 '가까우면'(박스 높이비 ≥ sign_near_ratio) 그 방향으로 목표
+        # offset 을 치우쳐(bias) 갈림길에서 그 갈래로 붙는다(순수 조향 편향, 정지 아님).
+        # 근접 표지가 sign_bias_hold_sec 동안 안 보이면 0 복귀(갈림길 통과 완료).
+        # sign_bias_magnitude(치우침 세기)는 실제 Y 에서 라이브로 튜닝할 것 — 제일 중요.
+        # +bias / -bias 가 물리적 좌/우 어느 쪽인지는 실측 후 필요시 부호만 뒤집으면 됨.
+        self.declare_parameter('sign_bias_enabled', True)
+        self.declare_parameter('sign_bias_magnitude', 0.35)   # 목표 offset 치우침(실측 튜닝)
+        self.declare_parameter('sign_near_ratio', 0.25)       # 박스 높이비 문턱(가까움 판정)
+        self.declare_parameter('sign_bias_hold_sec', 2.5)     # 결정 후 유지(갈림길 통과 시간)
+        self.declare_parameter('left_sign_label', 'left_sign')
+        self.declare_parameter('right_sign_label', 'right_sign')
 
         detection_topic = str(self.get_parameter('detection_topic').value)
         lane_topic = str(self.get_parameter('lane_topic').value)
@@ -449,7 +541,8 @@ class InterpretNode(Node):
 
         # --- 판단: 인지 정지/감속 판정 -> 제어(PID)로 목표 추종 -> Control 발행 ---
         stop, slow = self.judgment.perception_stop_slow()
-        steering, throttle, diag = self.controller.step(offset, confidence, stop, slow)
+        bias = self.judgment.lane_bias()
+        steering, throttle, diag = self.controller.step(offset, confidence, stop, slow, bias)
         self.publish_control(steering, throttle)
 
         if bool(self.get_parameter('debug_log').value):

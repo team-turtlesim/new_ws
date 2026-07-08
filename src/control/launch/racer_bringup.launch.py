@@ -65,11 +65,14 @@ INTERPRET_PARAMS = {
     'steer_smooth_alpha': 0.30,  # 0.35 -> 0.30 출력 평활 강화
     'd_offset_limit': 2.0,
     # 게인 스케줄링(직진<->곡선, |offset| 기준). 곡선에서 offset 이 벌어지면 kp↑.
+    # 07-08: 속도↑ 시 곡선 언더스티어(못 돎/이탈) -> 곡선 반응을 더 일찍(lo/hi↓) +
+    # 조향여유↑(steer_limit 0.7->0.8) 로 튜닝. (라이브 실측으로 추가 조정 여지 있음)
     'kp_offset_curve': 0.45,  # 곡선 kp(offset 교정 강화)
-    'sched_offset_lo': 0.3,
-    'sched_offset_hi': 0.6,
+    'sched_offset_lo': 0.15,  # 0.3 -> 0.15 곡선 반응 더 일찍 시작(언더스티어 대응)
+    'sched_offset_hi': 0.30,  # 0.6 -> 0.30 곡선 게인 더 빨리 최대
+    'steer_limit': 0.8,       # 0.7 -> 0.8 곡선 조향 범위 확대
     # 곡선 감속("코너 브레이크"): w↑ 에서 throttle 을 이 비율로 낮춰 라인 유지.
-    'curve_throttle_scale': 0.9,  # 곡선 감속 비율(cruise 0.19 x 0.9 = 0.17)
+    'curve_throttle_scale': 0.85,  # 0.9 -> 0.85 곡선 감속 약간 강화
     'cruise_throttle': 0.0,  # SAFE: no motion until raised via param
 }
 
