@@ -236,6 +236,121 @@ class Judgment:
         return tag
 
 
+class RampEntry:
+    """진입로(노란 램프) 진입 판단.
+
+    상태: WAIT -> APPROACH -> RAMP  (되돌아가지 않는다; 순서 게이팅)
+      WAIT     : 흰 차선 주행. 출발 후 arm_delay_sec 동안 움직인 뒤에야 감지를 무장한다
+                 (출발선 근처 오탐 차단). 조향/속도 무영향.
+      APPROACH : 원거리 밴드에서 '왼쪽 앞에 노랑' 단서를 봤다. 아직 흰 차선을 따라가되
+                 미리 감속한다. 램프 곡률이 본선 코너보다 조이므로 반응형 감속으론 늦다.
+      RAMP     : 근거리에서 노란 선이 안정적으로 잡혔다(커밋). 이제 노란 램프 중심을
+                 목표로 삼는다. 흰 차선은 더 안 본다.
+
+    커밋 조건을 '노랑이 처음 보일 때'가 아니라 '근거리에서 안정적으로 잡힐 때'로 둔 이유:
+    전자는 노란 선이 아직 멀어 근거리 목표를 못 만드는데도 목표를 갈아끼우는 셈이라,
+    하필 꺾어야 할 지점에서 confidence 0 -> 페일세이프 정지가 난다. 후자면 그 순간
+    노란 경계는 흰 경계가 있던 자리에 있어 offset 이 크게 안 튄다(기하적 연속성).
+
+    RAMP 중 노란 인지가 무너지면 정지가 아니라 흰 차선으로 '후퇴'한다(degraded).
+    노란색은 조명에 민감하므로, 인지 실패가 곧 이탈이 되지 않게 한다."""
+
+    def __init__(self, node):
+        self.node = node
+        self.state = 'WAIT'
+        self.moving_sec = 0.0        # 실제로 굴러간 시간(무장 타이머 기준)
+        self.armed = False
+        self.cue_frames = 0          # APPROACH 진입 디바운스
+        self.commit_frames = 0       # RAMP 커밋 디바운스
+        self.degrade_frames = 0      # 후퇴 디바운스
+        self.recover_frames = 0      # 복귀 디바운스
+        self.degraded = False        # RAMP 이지만 노란 인지가 무너져 흰 차선으로 후퇴 중
+        self.latest = None           # 최신 /yellow/lane (LaneDetection)
+        self.latest_time = None
+        self.heading = 0.0           # 조감도 heading (RAMP 추종 중에만 의미 있음)
+        self.approach_sec = 0.0      # APPROACH 체류 시간(분기 놓침 감지용)
+
+    def on_ramp(self, msg):
+        self.latest = msg
+        self.latest_time = self.node.get_clock().now()
+
+    def fresh(self):
+        """램프 인지가 살아있나. 노드가 죽었거나 프레임이 끊기면 없는 셈 친다."""
+        if self.latest is None or self.latest_time is None:
+            return None
+        age = (self.node.get_clock().now() - self.latest_time).nanoseconds * 1e-9
+        if age > float(self.node.get_parameter('ramp_stale_timeout_sec').value):
+            return None
+        return self.latest
+
+    def step(self, dt, throttle_cmd):
+        """한 프레임 진행. 반환: (use_ramp, raw_offset, confidence, throttle_scale, switched).
+
+        규칙 (2026-07-10, 단순화):
+          WAIT : 흰 차선 주행. 노란 차선이 commit_frames 연속 잡히면 곧장 RAMP.
+          RAMP : 노란 차선만 따라간다. **흰 차선으로 절대 후퇴하지 않는다.**
+                 노란 인지가 무너지면 신뢰도가 그대로 내려가고, interpret 의 기존
+                 페일세이프가 스로틀을 0 으로 내린다 — 정지가 오조향보다 낫다.
+                 (램프에 반쯤 올라탄 상태에서 흰 차선 명령을 받으면 엉뚱한 데로 간다.)
+        det 은 /yellow/lane 의 LaneDetection — lane_node 를 노란 마스크로 한 번 더 돌린
+        결과다. 단독선일 때 학습한 차선폭으로 반대편을 추정하는 로직이 그대로 산다."""
+        gp = self.node.get_parameter
+        none = (False, 0.0, 0.0, 1.0, False)
+        self.heading = 0.0            # offset 전용 (lane_node 규약)
+        if not bool(gp('ramp_enabled').value):
+            return none
+
+        if throttle_cmd > 0.0:
+            self.moving_sec += dt
+        if not self.armed and self.moving_sec >= float(gp('arm_delay_sec').value):
+            self.armed = True
+
+        det = self.fresh()
+        scale = float(gp('ramp_throttle_scale').value)
+
+        if det is None:
+            if self.state == 'RAMP':
+                # 인지 노드가 죽었다 -> 신뢰도 0 을 내려보내 페일세이프가 세우게 한다.
+                return (True, 0.0, 0.0, scale, False)
+            return none
+
+        if self.state == 'WAIT':
+            if self.armed and self._yellow_seen(det):
+                self.commit_frames += 1
+                if self.commit_frames >= int(gp('commit_frames').value):
+                    self.state = 'RAMP'
+                    self.node.get_logger().info(
+                        f'ramp: WAIT -> RAMP (노란 차선 커밋, off={det.raw_offset:+.3f} '
+                        f'conf={det.confidence:.2f})')
+                    return (True, float(det.raw_offset), float(det.confidence), scale, True)
+            else:
+                self.commit_frames = 0
+            return none
+
+        # --- RAMP: 후퇴 없음. 노란 차선만 본다. ---
+        return (True, float(det.raw_offset), float(det.confidence), scale, False)
+
+    def _yellow_seen(self, det):
+        """커밋해도 되는가. 커밋은 되돌릴 수 없으므로 엄격하게 본다.
+        진짜 램프 앞에서는 양쪽 노란 차선이 안정적으로 보인다 — 스치는 단독선이 아니라."""
+        gp = self.node.get_parameter
+        if float(det.confidence) < float(gp('commit_confidence').value):
+            return False
+        if bool(gp('commit_require_both').value):
+            return bool(det.left_detected) and bool(det.right_detected)
+        return bool(det.left_detected) or bool(det.right_detected)
+
+    def debug_tag(self):
+        if not bool(self.node.get_parameter('ramp_enabled').value):
+            return ''
+        tag = f' ramp={self.state}'
+        if self.state == 'WAIT' and not self.armed:
+            tag += '(disarmed)'
+        if self.degraded:
+            tag += '(degraded)'
+        return tag
+
+
 class Controller:
     """제어(Control law): 판단이 준 목표(offset + 정지/감속)를 PID 로 추종해 조향/스로틀
     명령을 계산한다. '무엇을/왜' 는 모른다 — 목표 추종만. 상태(적분·이전값·명령) 소유.
@@ -251,10 +366,19 @@ class Controller:
         self.was_low_conf = False                  # 직전 프레임 신뢰도 미달?
         self.integral = 0.0                        # offset 오차 적분(I 항)
 
-    def step(self, offset, confidence, stop, slow, bias=0.0):
+    def reseed(self, offset):
+        """목표의 출처가 바뀔 때(흰 차선 <-> 노란 램프) 호출. offset 이 다른 기준으로
+        점프하므로 이 프레임의 미분은 의미가 없다 -> 직전값을 새 offset 으로 맞춰
+        d(offset)/dt = 0 으로 만들고 적분을 비운다. (차선 재획득 시의 처리와 같은 이유)"""
+        self.prev_offset_for_d = offset
+        self.integral = 0.0
+
+    def step(self, offset, confidence, stop, slow, bias=0.0, throttle_scale_extra=1.0,
+             heading=0.0):
         """offset PID + 스로틀 목표(정지/감속 반영) + 슬루 -> (steering, throttle, diag).
         bias: 방향표지 바이어스(목표 offset 치우침; 0=중앙유지). P/I 오차에만 반영,
-        미분(D)은 원 offset 기준(setpoint 변화에 미분 튐 방지)."""
+        미분(D)은 원 offset 기준(setpoint 변화에 미분 튐 방지).
+        throttle_scale_extra: 구간별 추가 감속 배율(진입 접근/램프 주행). 1.0 = 무영향."""
         gp = self.node.get_parameter
         now = self.node.get_clock().now()
         if self.prev_time is None:
@@ -302,7 +426,11 @@ class Controller:
         i_term = clip(ki * self.integral, -i_limit, i_limit)
 
         # PID 후 EMA 저역통과로 부드러운 출력.
-        logical = kp * error + i_term + kd * d_offset
+        # heading 항은 진입(RAMP)에서만 0 이 아니다. 그 구간에선 횡오차가 ≈0 이라
+        # "얼마나 틀어져 있나"가 유일한 조향 신호다. 부호 규약은 offset 과 동일(음수=좌).
+        h_lim = float(gp('heading_limit_rad').value)
+        h_term = float(gp('kh_ramp').value) * clip(heading, -h_lim, h_lim)
+        logical = kp * error + i_term + kd * d_offset + h_term
         logical = clip(logical, -steer_limit, steer_limit)
         steering_raw = clip(self.steer_trim + steer_sign * logical, -1.0, 1.0)
         self.steer_cmd_filtered = (
@@ -315,7 +443,7 @@ class Controller:
         max_throttle = float(gp('max_throttle').value)
         slew = float(gp('throttle_slew_per_sec').value)
         curve_thr_scale = float(gp('curve_throttle_scale').value)
-        throttle_scale = lerp(1.0, curve_thr_scale, w)
+        throttle_scale = lerp(1.0, curve_thr_scale, w) * clip(throttle_scale_extra, 0.0, 1.0)
         target_throttle = 0.0 if low_conf else clip(cruise * throttle_scale, 0.0, max_throttle)
         # 판단이 준 정지/감속 반영 (원래 apply_perception_gate 의 적용부와 동일).
         if stop:
@@ -394,6 +522,47 @@ class InterpretNode(Node):
         # 가장자리를 스침 -> 감속해야 라인 유지.
         # throttle = cruise × lerp(1.0, curve_throttle_scale, w). w=1 에서 이 비율로.
         self.declare_parameter('curve_throttle_scale', 0.9)
+
+        # --- 진입로(노란 램프) 진입 판단 ------------------------------------
+        # 마스터 스위치. 기본 False -> ramp_detection 이 떠 있어도 주행에 영향 없다.
+        # 대시보드 Ramp 패널로 /yellow/lane 을 확인한 뒤에 켠다:
+        #   ros2 param set /interpret_node ramp_enabled true
+        self.declare_parameter('ramp_enabled', False)
+        # 노란 차선 인지 = lane_node 를 /opencv/image/yellow 로 한 번 더 돌린 것.
+        # 메시지도 LaneDetection 그대로다(별도 msg/알고리즘 없음).
+        self.declare_parameter('ramp_detection_topic', '/yellow/lane')
+        # 인지가 이 시간 넘게 끊기면 없는 셈(노드 사망이 브레이크를 잡지 않게).
+        self.declare_parameter('ramp_stale_timeout_sec', 0.5)
+        # 무장: 실제로 굴러간 시간이 이만큼 지나야 감지 시작(출발선 근처 오탐 차단).
+        # 램프 바로 앞에서 출발시킬 땐 짧게 줄일 것(안 그러면 무장 전에 분기를 지나친다).
+        self.declare_parameter('arm_delay_sec', 3.0)
+
+        # 커밋: 노란 차선이 이만큼 잡히면 곧장 RAMP. 흰 차선으로 후퇴는 없다.
+        # 커밋은 되돌릴 수 없으므로 '스치는 노란 선'과 '진짜 램프'를 신뢰도로 가른다.
+        # 2026-07-10 실주행으로 문턱을 훑어 확정:
+        #   conf 0.6  -> t=7.0s 커밋, 한 프레임 뒤 소실 -> 즉시 정지 (너무 늦게 커밋)
+        #   conf 0.5  -> t=10.0s 커밋, 2.5초 추종 후 정지
+        #   conf 0.35 -> t=8.5s 커밋, 3.5초 추종, **램프 안 진입 성공**  <= 채택
+        #   conf 0.3/3프레임 -> 본선 주행 중 트랙 저편 노란 링(conf 0.25~0.33)에 오커밋
+        # 낮출수록 더 일찍 커밋해 더 오래 따라간다. 0.35 가 오커밋(0.33)과 진짜 램프
+        # 사이의 좁은 틈이다. 유지 프레임(8)이 스치는 선을 한 번 더 거른다.
+        self.declare_parameter('commit_confidence', 0.35)
+        self.declare_parameter('commit_frames', 8)      # 30Hz 기준 약 0.27초 유지
+        # True 면 양쪽 노란 차선이 모두 보일 때만 커밋. 주행 중엔 너무 엄격해 기본 False.
+        self.declare_parameter('commit_require_both', False)
+        self.declare_parameter('ramp_throttle_scale', 0.6)     # 램프 곡률이 조여 감속 유지
+
+        # 진입 조향에 쓰는 heading 게인. RAMP 상태에서만 적용된다.
+        # 2026-07-09: 램프 진입 시 횡오차는 이미 ≈0 인데 경계선이 지면 기준 −14° 기울어
+        # 있다. 즉 "옆으로 얼마나 벗어났나"가 아니라 "얼마나 틀어져 있나"가 전부다.
+        # 조감도(IPM)에서 잰 heading 이라 지면 실각도 — 원본 화면 heading(07-06 제거,
+        # 원근 왜곡으로 ±0.5rad 스파이크)과는 완전히 다른 물건이다.
+        # 흰 차선 주행은 여전히 offset 전용이라 검증된 튜닝이 안 깨진다.
+        # 2026-07-10 실주행: kh=1.0 은 진입은 되는데 '너무 꺾여' 램프 안에서 탈선했다.
+        # heading 이 커질수록 더 꺾고, 조향을 풀어줄 신호가 없었다(중앙잡기 전환 부재).
+        self.declare_parameter('kh_ramp', 0.5)
+        # heading 항의 기여 상한(rad). 급커브에서 heading 이 커져도 조향이 폭주하지 않게.
+        self.declare_parameter('heading_limit_rad', 0.30)
 
         # --- 페일세이프 -----------------------------------------------------
         self.declare_parameter('min_confidence', 0.2)   # 미만 -> lost 취급
@@ -475,6 +644,9 @@ class InterpretNode(Node):
         # 둘 다 파라미터/시계는 이 노드에서 읽는다. 한 콜백에서 이어 실행(이벤트구동 유지).
         self.judgment = Judgment(self)
         self.controller = Controller(self, self.steer_trim)
+        # 진입로 진입 판단(순서 게이팅 상태기계). ramp_enabled=False 면 아무것도 안 한다.
+        self.ramp = RampEntry(self)
+        self.prev_step_time = None   # RampEntry 무장 타이머용 dt
 
         self.subscription = self.create_subscription(
             LaneDetection,
@@ -498,6 +670,14 @@ class InterpretNode(Node):
             Bool,
             str(self.get_parameter('aruco_stop_topic').value),
             self.aruco_callback,
+            10,
+        )
+
+        # 노란 차선 인지 구독(/yellow/lane, LaneDetection). gate 는 ramp_enabled.
+        self.ramp_sub = self.create_subscription(
+            LaneDetection,
+            str(self.get_parameter('ramp_detection_topic').value),
+            self.ramp_callback,
             10,
         )
 
@@ -525,9 +705,32 @@ class InterpretNode(Node):
         # 단독선 = 좌/우 중 정확히 한쪽만 검출 (XOR)
         single_line = bool(msg.left_detected) != bool(msg.right_detected)
 
+        # --- 판단: 진입로 상태기계가 목표의 '출처'를 고른다 (흰 차선 vs 노란 램프) ---
+        now = self.get_clock().now()
+        if self.prev_step_time is None:
+            dt = 1.0 / 30.0
+        else:
+            dt = (now - self.prev_step_time).nanoseconds * 1e-9
+            if dt <= 0.0 or dt > 1.0:
+                dt = 1.0 / 30.0
+        self.prev_step_time = now
+        use_ramp, ramp_offset, ramp_conf, thr_scale, switched = self.ramp.step(
+            dt, self.controller.throttle_cmd)
+
+        if use_ramp:
+            raw_offset, confidence = ramp_offset, ramp_conf
+            detected, single_line = True, False   # 램프 목표는 이미 완성된 차로 중심
+        else:
+            raw_offset, confidence = float(msg.raw_offset), float(msg.confidence)
+
+        # 출처가 바뀐 프레임: offset 기준이 달라져 미분이 무의미하고 EMA 가 옛 값을
+        # 끌고 간다 -> EMA 를 새 값으로 시드하고 미분/적분을 리셋(조향 슬램 방지).
+        if switched:
+            self.judgment.offset_filtered = raw_offset
+            self.controller.reseed(raw_offset)
+
         # --- 판단: offset 시간필터 ---
-        offset = self.judgment.filter_offset(float(msg.raw_offset), detected, single_line)
-        confidence = float(msg.confidence)
+        offset = self.judgment.filter_offset(raw_offset, detected, single_line)
 
         # 판단 결과를 LaneInfo 로도 발행(디버그/rosbag; 런타임 구독자는 없음).
         lane_info = LaneInfo()
@@ -542,15 +745,24 @@ class InterpretNode(Node):
         # --- 판단: 인지 정지/감속 판정 -> 제어(PID)로 목표 추종 -> Control 발행 ---
         stop, slow = self.judgment.perception_stop_slow()
         bias = self.judgment.lane_bias()
-        steering, throttle, diag = self.controller.step(offset, confidence, stop, slow, bias)
+        # heading 은 램프 목표를 실제로 쓰는 프레임에서만 조향에 들어간다(흰 차선 무영향).
+        heading = self.ramp.heading if use_ramp else 0.0
+        steering, throttle, diag = self.controller.step(
+            offset, confidence, stop, slow, bias, thr_scale, heading)
         self.publish_control(steering, throttle)
 
         if bool(self.get_parameter('debug_log').value):
+            hd = f' hdg={heading:+.3f}' if use_ramp else ''
             self.get_logger().info(
                 f'off={offset:+.3f} i={diag["i"]:+.3f} d={diag["d"]:+.3f} '
-                f'conf={confidence:.2f} w={diag["w"]:.2f} kp={diag["kp"]:.2f} '
-                f'-> steer={steering:+.3f} thr={throttle:.3f}{self.judgment.debug_tag()}'
+                f'conf={confidence:.2f} w={diag["w"]:.2f} kp={diag["kp"]:.2f}{hd} '
+                f'-> steer={steering:+.3f} thr={throttle:.3f}'
+                f'{self.judgment.debug_tag()}{self.ramp.debug_tag()}'
             )
+
+    def ramp_callback(self, msg: LaneDetection):
+        """노란 차선 인지(/yellow/lane)를 상태기계에 넘긴다(판정은 detection_callback 에서)."""
+        self.ramp.on_ramp(msg)
 
     def publish_control(self, steering, throttle):
         msg = Control()

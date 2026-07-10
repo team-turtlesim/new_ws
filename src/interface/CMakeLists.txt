@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Control.msg"
   "msg/LaneInfo.msg"
   "msg/LaneDetection.msg"
+  "msg/RampDetection.msg"
   "msg/Detection.msg"
   "msg/DetectionArray.msg"
   DEPENDENCIES std_msgs

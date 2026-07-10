@@ -19,15 +19,18 @@ then:
 control_node 에는 stale 워치독이 있어, interpret(이벤트구동)이 프레임 끊김으로
 발행을 멈추면 자동으로 조향 중립 + 정지한다.
 
-Add `yolo:=true` to ALSO start yolo_node (객체검출). 검출은 대시보드 YOLO 패널에
-표시되지만, interpret 는 yolo_enabled=false 라 제어(정지/감속)엔 관여하지 않는다.
-검증 후 `ros2 param set /interpret_node yolo_enabled true` 로 제어 연동을 켠다.
+Add `yolo:=true` to ALSO start yolo_node (객체검출). interpret 는 yolo_enabled=true 가
+기본이라 검출이 곧바로 제어에 물린다: 신호등 정지/출발 + 방향표지 갈래선택(바이어스).
+표시만 하고 제어에서 떼려면 `ros2 param set /interpret_node yolo_enabled false`.
+
+Add `aruco:=true` 도 마찬가지로 aruco_enabled=true 가 기본이라 /aruco_stop 이 곧바로
+정지에 물린다. 떼려면 `ros2 param set /interpret_node aruco_enabled false`.
 
 Usage:
     ros2 launch control racer_bringup.launch.py                 # web + perception + judgment
     ros2 launch control racer_bringup.launch.py drive:=true     # + actuator
-    ros2 launch control racer_bringup.launch.py yolo:=true      # + object detection (표시만)
-    ros2 launch control racer_bringup.launch.py aruco:=true     # + ArUco 마커 검출 (표시만)
+    ros2 launch control racer_bringup.launch.py yolo:=true      # + object detection (제어 연동)
+    ros2 launch control racer_bringup.launch.py aruco:=true     # + ArUco 마커 검출 (제어 연동)
     ros2 launch control racer_bringup.launch.py debug_overlay:=false  # raw edge pane
 """
 
@@ -85,6 +88,7 @@ def generate_launch_description():
     debug_overlay = LaunchConfiguration('debug_overlay')
     yolo = LaunchConfiguration('yolo')
     aruco = LaunchConfiguration('aruco')
+    ramp = LaunchConfiguration('ramp')
 
     # monitor "edge" pane topic: lane overlay when debug_overlay, else raw edge.
     edge_topic = PythonExpression([
@@ -104,16 +108,23 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'yolo', default_value='false',
             description='Also start yolo_node (object detection) + show its overlay '
-                        'pane on the dashboard. interpret 는 yolo_enabled=false 라 '
-                        '검출을 표시만 하고 제어(정지/감속)엔 관여하지 않는다 — 검증 후 '
-                        'ros2 param set /interpret_node yolo_enabled true 로 켠다.',
+                        'pane on the dashboard. interpret 가 yolo_enabled=true 기본이라 '
+                        '검출이 제어에 물린다(신호등 정지/출발, 방향표지 바이어스) — 표시만 '
+                        '하려면 ros2 param set /interpret_node yolo_enabled false 로 끈다.',
         ),
         DeclareLaunchArgument(
             'aruco', default_value='false',
             description='Also start aruco_node (ArUco 마커 검출) + show its overlay '
                         'pane on the dashboard. /detected_marker_id + /aruco_stop 를 '
-                        '발행하지만 지금은 어떤 노드도 구독하지 않아 주행엔 영향 없다 '
-                        '(interpret 연동은 추후).',
+                        '발행하고, interpret 가 aruco_enabled=true 기본이라 정지에 물린다 '
+                        '— 떼려면 ros2 param set /interpret_node aruco_enabled false.',
+        ),
+        DeclareLaunchArgument(
+            'ramp', default_value='false',
+            description='Also start ramp_node (노란 진입로 인지). /ramp/detection 을 '
+                        '발행한다. interpret 는 ramp_enabled=false 기본이라 주행엔 영향 '
+                        '없다 — 대시보드/로그로 인지를 확인한 뒤 '
+                        'ros2 param set /interpret_node ramp_enabled true 로 켠다.',
         ),
 
         # --- Perception + judgment/control-law + web (always) ---
@@ -134,10 +145,25 @@ def generate_launch_description():
              output='screen',
              parameters=[cfg, {
                  'opencv_edge_topic': edge_topic,
-                 # yolo:=true / aruco:=true 일 때만 대시보드에 해당 오버레이 패널 표시.
+                 # yolo/aruco/ramp:=true 일 때만 대시보드에 해당 오버레이 패널 표시.
+                 # edge 패널은 계속 lane_detection 오버레이(흰 차선)를 보여준다 —
+                 # ramp 는 자기 패널을 따로 갖는다.
                  'yolo_debug': ParameterValue(yolo, value_type=bool),
                  'aruco_debug': ParameterValue(aruco, value_type=bool),
+                 'ramp_debug': ParameterValue(ramp, value_type=bool),
+                 # Ramp 패널 = 노란 마스크로 돌린 lane_node 의 오버레이.
+                 'ramp_debug_topic': '/yellow_lane/image/debug',
              }]),
+
+        # --- Ramp (yellow) perception (only with ramp:=true) ---
+        # ramp_node 는 lane_node 의 사본이다(알고리즘 동일: 행별 클러스터 추적 + 단독선일
+        # 때 학습한 차선폭으로 반대편 추정). 입력만 노란 마스크.
+        # 별도 노드로 둔 이유: 앞으로 여기에 링 주행·탈출 알고리즘(12시 마커 카운트,
+        # 안쪽/바깥쪽 경계 선택 등)이 들어간다. 같은 노드를 두 인스턴스로 쓰면 그 변경이
+        # 트랙 검증이 끝난 흰 차선 주행까지 건드린다. 지금은 같지만 앞으로 갈라진다.
+        Node(package='ramp_detection', executable='ramp_node',
+             name='ramp_detection_node', output='screen', parameters=[cfg],
+             condition=IfCondition(ramp)),
 
         # --- Object detection (only with yolo:=true) ---
         # 카메라 원본(/camera/image/compressed)을 직접 구독하는 독립 인지 브랜치.
@@ -148,7 +174,7 @@ def generate_launch_description():
 
         # --- ArUco marker detection (only with aruco:=true) ---
         # 카메라 원본을 직접 구독하는 독립 인지 브랜치. /detected_marker_id + /aruco_stop
-        # + /aruco/image/debug 발행. 현재 구독자 없어 주행 무영향(추후 interpret 연동).
+        # + /aruco/image/debug 발행. interpret 가 /aruco_stop 을 구독해 정지에 반영한다.
         Node(package='aruco', executable='aruco_node', name='aruco_node',
              output='screen', condition=IfCondition(aruco)),
 

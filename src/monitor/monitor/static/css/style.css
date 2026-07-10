@@ -273,9 +273,15 @@ code {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+/* Edge + Ramp + YOLO + ArUco 네 패널: 4열로 표시 */
+.debug-grid--quad {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .debug-panel--edge .debug-panel__frame,
 .debug-panel--yolo .debug-panel__frame,
-.debug-panel--aruco .debug-panel__frame {
+.debug-panel--aruco .debug-panel__frame,
+.debug-panel--ramp .debug-panel__frame {
   max-height: 60vh;
   object-fit: contain;
   margin: 0 auto;

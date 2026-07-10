@@ -43,6 +43,8 @@ def create_app( state, page_title,
                 yolo_debug_topic='/yolo/image/debug',
                 aruco_debug=False,
                 aruco_debug_topic='/aruco/image/debug',
+                ramp_debug=False,
+                ramp_debug_topic='/ramp_detection/image/debug',
                 graph_snapshot_provider=None ):
     
     app = Flask( __name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR),)
@@ -71,6 +73,8 @@ def create_app( state, page_title,
             yolo_debug_topic=yolo_debug_topic,
             aruco_debug=aruco_debug,
             aruco_debug_topic=aruco_debug_topic,
+            ramp_debug=ramp_debug,
+            ramp_debug_topic=ramp_debug_topic,
         )
 
     @app.get('/api/status')
@@ -159,6 +163,22 @@ def create_app( state, page_title,
             return Response(
                 build_camera_placeholder_svg(
                     image_display_width, image_display_height, yolo_debug_topic
+                ),
+                mimetype='image/svg+xml',
+            )
+
+        response = Response(frame_bytes, mimetype='image/jpeg')
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        return response
+
+    @app.get('/api/frame/ramp')
+    def api_frame_ramp():
+        frame_bytes = state.get_debug_frame('ramp')
+        if frame_bytes is None:
+            return Response(
+                build_camera_placeholder_svg(
+                    image_display_width, image_display_height, ramp_debug_topic
                 ),
                 mimetype='image/svg+xml',
             )

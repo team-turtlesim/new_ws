@@ -52,6 +52,17 @@ class OpenCvNode(Node):
         self.declare_parameter('yellow_h_max', 38)
         self.declare_parameter('yellow_s_min', 80)
         self.declare_parameter('yellow_v_min', 80)
+        # /edge 에 실을 색. 'white'(기본) | 'both'(흰|노랑 OR, 예전 동작).
+        # lane_detection 은 색을 구분하지 않으므로, 노란색이 섞이면 램프 선을 차선으로
+        # 오인한다(2026-07-10 실측: 램프 앞 ROI 입력의 39%가 노란 픽셀이었다).
+        self.declare_parameter('edge_color', 'white')
+        # 노란색 전용 마스크를 /opencv/image/yellow 로 따로 발행(ramp_detection 이 구독).
+        # /opencv/image/edge 는 예전 그대로 흰|노랑 OR 이라 기존 차선주행은 무영향.
+        # detect_mode='edge'(Canny) 면 색 정보가 없어 발행하지 않는다.
+        self.declare_parameter('publish_yellow', True)
+        # 입력 채널 순서 보정. imdecode 결과를 BGR 로 가정하고 cvtColor(BGR2HSV) 한다.
+        # 실제 C920 은 bgr8 이라 False. rgb8 소스(시뮬 등)면 True 로 켜야 노란색이 잡힌다.
+        self.declare_parameter('swap_rb', False)
 
         subscribe_topic = str(self.get_parameter('subscribe_topic').value)
         self.vehicle_config_file = os.path.expanduser(
@@ -60,6 +71,7 @@ class OpenCvNode(Node):
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.debug_log = bool(self.get_parameter('debug_log').value)
         self.publish_debug_streams = bool(self.get_parameter('publish_debug_streams').value)
+        self.publish_yellow = bool(self.get_parameter('publish_yellow').value)
 
         if not 0 <= self.jpeg_quality <= 100:
             raise ValueError('jpeg_quality must be in range [0, 100]')
@@ -91,6 +103,12 @@ class OpenCvNode(Node):
             '/opencv/image/edge',
             image_qos,
         )
+        # 노란색 전용 마스크(ramp_detection 용) -> 켜졌을 때만 퍼블리셔 생성.
+        self.yellow_pub = None
+        if self.publish_yellow:
+            self.yellow_pub = self.create_publisher(
+                CompressedImage, '/opencv/image/yellow', image_qos,
+            )
         # gray/blur 는 디버그용 -> 켜졌을 때만 퍼블리셔 생성.
         self.gray_pub = None
         self.blur_pub = None
@@ -126,11 +144,19 @@ class OpenCvNode(Node):
         return width, height
 
     def color_lane_mask(self, bgr):
-        """흰색+노란색 차선만 남기는 이진 마스크(HSV 색 임계값).
+        """(/edge 용 차선 마스크, 노란색 전용 마스크)를 돌려준다.
 
         Canny 는 모든 경계(그림자·트랙끝·다른 차)를 다 잡아 노이즈가 많지만,
         색 임계값은 차선 색만 골라내 더 안정적일 수 있다(대신 조명 변화에 민감).
         임계값은 파라미터로 노출 -> venue 조명에서 라이브 튜닝 가능.
+
+        edge_color 로 /edge 에 실을 색을 고른다:
+          'white'(기본) : 흰색만. lane_detection 이 노란 램프 선을 차선으로 오인하지 않는다.
+          'both'        : 흰|노랑 OR (예전 동작).
+        2026-07-10 실측: 램프 앞에서 lane_detection 의 ROI 입력 중 **39%가 노란 픽셀**
+        이었다. 그 오염된 입력으로 계산한 offset 이 ±1.0 로 포화하고, 램프 신뢰도가
+        떨어져 흰 차선으로 후퇴할 때마다 엉뚱한 조향을 냈다. 본선에는 노란 선이 없으므로
+        'white' 로 둬도 본선 주행은 그대로다.
         """
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         gp = self.get_parameter
@@ -151,10 +177,13 @@ class OpenCvNode(Node):
             ], dtype=np.uint8),
             np.array([int(gp('yellow_h_max').value), 255, 255], dtype=np.uint8),
         )
-        mask = cv2.bitwise_or(white, yellow)
+        edge_color = str(gp('edge_color').value)
+        mask = white if edge_color == 'white' else cv2.bitwise_or(white, yellow)
         # 점잡음 제거
         mask = cv2.medianBlur(mask, 5)
-        return mask
+        # 노란색 전용 마스크도 같은 잡음제거를 거쳐 함께 돌려준다(원본 유지, 닫힘 없음 —
+        # 점선 잇기는 소비자인 ramp_detection 이 필요할 때만 국소 적용한다).
+        return mask, cv2.medianBlur(yellow, 5)
 
     def to_compressed_msg(self, image, source_msg: CompressedImage, frame_id: str):
         ok, encoded = cv2.imencode(
@@ -183,6 +212,10 @@ class OpenCvNode(Node):
 
         # 차선 처리 해상도로 다운스케일(카메라가 640x480 이어도 여기서 320x160 으로).
         # 이후 Canny/인코딩이 전부 저해상도에서 돌아 차선 튜닝값(ROI/px)이 그대로 유효.
+        # 채널 순서 보정: 입력이 RGB 면 BGR 로 스왑해야 이후 BGR2HSV/색마스크가 맞다.
+        if bool(self.get_parameter('swap_rb').value):
+            np_arr = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR)
+
         if self.lane_proc_width > 0 and self.lane_proc_height > 0 and (
             np_arr.shape[1] != self.lane_proc_width
             or np_arr.shape[0] != self.lane_proc_height
@@ -199,8 +232,9 @@ class OpenCvNode(Node):
         # 차선 이진영상 생성: color 모드면 흰/노랑 색마스크, 아니면 Canny 엣지.
         # 어느 쪽이든 lane_detection 은 동일하게 /opencv/image/edge 를 구독해 처리한다.
         mode = str(self.get_parameter('detect_mode').value)
+        yellow_mask = None
         if mode == 'color':
-            edge = self.color_lane_mask(np_arr)
+            edge, yellow_mask = self.color_lane_mask(np_arr)
         else:
             edge = cv2.Canny(blur, 50, 150)
 
@@ -208,6 +242,12 @@ class OpenCvNode(Node):
         if edge_msg is None:
             return
         self.edge_pub.publish(edge_msg)
+
+        # 노란색 전용 마스크 발행(color 모드에서만 존재). ramp_detection 이 구독.
+        if self.yellow_pub is not None and yellow_mask is not None:
+            yellow_msg = self.to_compressed_msg(yellow_mask, msg, frame_id='opencv_yellow')
+            if yellow_msg is not None:
+                self.yellow_pub.publish(yellow_msg)
 
         # gray/blur 는 디버그용 -> 켜졌을 때만 인코딩/발행(평소 CPU 절약).
         if self.publish_debug_streams:

@@ -64,6 +64,8 @@ class MonitorNode(Node):
         self.declare_parameter('yolo_debug', False)  # YOLO 오버레이 패널 표시 여부
         self.declare_parameter('aruco_debug_topic', '/aruco/image/debug')
         self.declare_parameter('aruco_debug', False)  # ArUco 오버레이 패널 표시 여부
+        self.declare_parameter('ramp_debug_topic', '/ramp_detection/image/debug')
+        self.declare_parameter('ramp_debug', False)  # 진입로(노란 램프) 오버레이 패널 표시 여부
         self.declare_parameter('control_topic', '/control')
         self.declare_parameter('storage_path', '/')
         self.declare_parameter('storage_poll_interval_sec', 1.0)
@@ -95,6 +97,8 @@ class MonitorNode(Node):
         self.yolo_debug = bool(self.get_parameter('yolo_debug').value)
         self.aruco_debug_topic = self.get_yaml_or_param_str(yaml_config, 'ARUCO_DEBUG_TOPIC', 'aruco_debug_topic')
         self.aruco_debug = bool(self.get_parameter('aruco_debug').value)
+        self.ramp_debug_topic = self.get_yaml_or_param_str(yaml_config, 'RAMP_DEBUG_TOPIC', 'ramp_debug_topic')
+        self.ramp_debug = bool(self.get_parameter('ramp_debug').value)
         if not self.control_topic:
             # Backward compatibility for legacy typo key.
             self.control_topic = str(yaml_config.get('CONTORL_TOPIC', '')).strip()
@@ -165,6 +169,8 @@ class MonitorNode(Node):
             yolo_debug_topic=self.yolo_debug_topic,
             aruco_debug=self.aruco_debug,
             aruco_debug_topic=self.aruco_debug_topic,
+            ramp_debug=self.ramp_debug,
+            ramp_debug_topic=self.ramp_debug_topic,
             graph_snapshot_provider=self.get_graph_snapshot,
         )
         self.server_thread = FlaskServerThread(self.app, self.web_host, self.web_port)
@@ -212,6 +218,13 @@ class MonitorNode(Node):
                     CompressedImage,
                     self.aruco_debug_topic,
                     self.debug_aruco_callback,
+                    10,
+                )
+            if self.ramp_debug:
+                self.create_subscription(
+                    CompressedImage,
+                    self.ramp_debug_topic,
+                    self.debug_ramp_callback,
                     10,
                 )
         self.create_subscription(
@@ -340,6 +353,9 @@ class MonitorNode(Node):
 
     def debug_aruco_callback(self, msg):
         self._debug_image_callback(msg, 'aruco', self.aruco_debug_topic)
+
+    def debug_ramp_callback(self, msg):
+        self._debug_image_callback(msg, 'ramp', self.ramp_debug_topic)
 
     def storage_timer_callback(self):
         try:
