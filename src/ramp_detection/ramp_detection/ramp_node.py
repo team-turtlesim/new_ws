@@ -114,16 +114,44 @@ class RampDetectionNode(Node):
         # 연속 런은 마커가 시야에 있기만 하면 길게 나온다. 그래서 런 길이를 쓴다.
         # 문턱 70px 은 주행 중 오검출(68px)에 걸렸다 -> 120px (68 과 138 의 정중앙).
         self.declare_parameter('marker_run_px', 120)
+        # 마커로 인정할 최소 '가로행 수'. 진짜 12시 실선은 두꺼운 밴드라 여러 행이
+        # run≥marker_run_px 를 만족한다(2026-07-12 run3 실측: 4~16행, 피크 213px).
+        # 오검출(곡선에서 비스듬해진 세로차선이 순간 120px 런)은 1행뿐 -> 이걸로 배제.
+        # (run3: #1 진짜=밴드 4~16행, #2 거짓=1행. min_rows=3 이면 #2 제거, #1 유지.)
+        self.declare_parameter('marker_min_rows', 3)
         # 마커 판정 디바운스(연속 프레임). rising-edge 로 랩 카운트.
         self.declare_parameter('marker_frames', 2)
         # 마커를 한 번 센 뒤 이 프레임 수 동안은 다시 세지 않는다(중복 카운트 방지).
         # 2026-07-10: run 이 문턱을 넘나들 때마다 marker_active 가 풀렸다 걸려 한 바퀴도
         # 안 돌았는데 마커를 9번 세었다. 마커 하나를 지나는 데 걸리는 시간보다 길게 잡는다.
         self.declare_parameter('marker_cooldown_frames', 90)   # ≈3초 @30Hz
-        # 마커를 본 뒤 점선 추종을 유지할 프레임 수(≈30Hz). 출구를 지나칠 때까지.
-        self.declare_parameter('marker_hold_frames', 45)
-        # 마커 구간에서 따라갈 점선이 어느 쪽인가. 'right' = 오른쪽 점선.
-        self.declare_parameter('marker_follow_side', 'right')
+        # (DEPRECATED, 미사용) 예전엔 마커 후 이 프레임 수만큼 점선추종을 유지했으나,
+        # 2026-07-12 마커 카운트 기반 유지로 바뀜: 1번째 마커~2번째 마커 사이(marker_count==1)
+        # 내내 점선추종, 2번째 마커 후 일반차선 복귀(탈출). 프레임 타임아웃 게이팅 폐기.
+        self.declare_parameter('marker_hold_frames', 120)
+        # 마커 구간에서 앵커할 선 선택. **'dashed' = 실선 제외, 점선 중 맨 오른쪽(기본).**
+        # 2026-07-12 실측: 12시 출구엔 점선(고어)+바깥 실선이 같이 보이는데 'right'(맨
+        # 오른쪽 선)는 바깥 '실선'을 물고 출구로 나가버렸다. 점선(끊김=검출 행 적음)만
+        # 후보로 삼고 실선(연속=행 많음, ≥solid_row_min)은 뺀 뒤, 점선이 여럿이면 맨
+        # 오른쪽을 고른다. 'right'/'left'=위치 고정, 'auto'=행 적은 선 자동(점선2개면 불안정).
+        self.declare_parameter('marker_follow_side', 'dashed')
+        # 이 행 수 이상 검출되면 '실선'으로 보고 점선 후보에서 제외(num_scan_rows=12 기준).
+        self.declare_parameter('solid_row_min', 8)
+        # 점선에서 '얼마나 왼쪽(안쪽)을 겨냥할지'(px). 예전엔 lane_width_px/2(≈99)를 썼는데
+        # lane_width_px 학습이 오염돼(≈198, 실제 간격 ~85) 목표가 과도하게 왼쪽으로 쏠렸다.
+        # 이 값으로 분리해 직접 튜닝한다(작을수록 점선에 더 붙어 감).
+        self.declare_parameter('dash_aim_px', 45)
+        # 'auto' 동점 가드: 두 선이 다 후보일 때 행 수 차이가 이 값 이상이어야 '적은 선'을
+        # 점선으로 고른다. 근소차/동점은 애매 -> 직전 선택 유지(07-10 포화 재발 방지).
+        self.declare_parameter('dashed_row_margin', 2)
+        # 점선 공백 다리(bridge) + 연속성 게이트: 오른쪽 점선(파란선)은 끊겨 있어 순간
+        # 검출이 비거나(공백), 4시 진입 접합부에선 점선보다 입구 실선이 먼저 보여 앵커가
+        # 엉뚱한 데로 튄다. 그때 직전 앵커(lane_center)를 이 프레임 수까지 유지하며
+        # 코스팅해 진짜 점선을 재획득할 때까지 버틴다(2026-07-12 실측: 공백/4시 이탈 대응).
+        self.declare_parameter('dash_hold_frames', 30)   # ≈1초 @30Hz
+        # 연속성 게이트: 새 앵커가 직전 앵커보다 이 px 이상 튀면 '다른 선을 문 것'으로 보고
+        # 버린 뒤 직전 앵커를 유지한다(4시 입구 실선이 맨 오른쪽에 나타나도 안 끌려감).
+        self.declare_parameter('max_anchor_jump_px', 50)
         # 마커에 걸린 스캔행은 차선 검출에서 제외한다. 안 그러면 가로선이 좌/우 차선으로
         # 잘못 잡혀(한 행이 통째로 한 클러스터) 검출이 오염된다.
         self.declare_parameter('marker_exclude_rows', True)
@@ -138,8 +166,10 @@ class RampDetectionNode(Node):
         self.marker_active = False   # 지금 마커 위인가(중복 카운트 방지 래치)
         self.marker_on = 0           # 마커 감지 디바운스(rising)
         self.marker_off = 0          # 마커 해제 디바운스(falling)
-        self.hold_left = 0           # 점선 추종을 유지할 남은 프레임
         self.cooldown_left = 0       # 이 프레임 동안은 마커를 다시 세지 않는다
+        self._dash_prev_side = None  # 'auto' 애매 프레임에서 유지할 직전 점선 쪽
+        self._last_dash_center = None  # 점선 공백 다리용: 직전 유효 앵커 lane_center
+        self._dash_miss = 0            # 점선 연속 공백(미검출) 프레임 수
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -217,12 +247,17 @@ class RampDetectionNode(Node):
                 rows.append(y)
         return rows, best
 
-    def update_marker(self, has_marker):
+    def update_marker(self, has_marker, rows=None, best=0):
         """마커를 rising-edge 로 카운트하고, 지나간 뒤에도 점선 추종을 유지할
         hold 프레임을 채운다. 마커 위에 올라서는 '그 순간' 한 번만 +1.
 
         쿨다운: 한 번 센 뒤 marker_cooldown_frames 동안은 다시 세지 않는다. run 이
-        문턱을 넘나들며 marker_active 가 풀렸다 걸리는 것을 막는다(중복 카운트)."""
+        문턱을 넘나들며 marker_active 가 풀렸다 걸리는 것을 막는다(중복 카운트).
+
+        진단(2026-07-12): 검출 순간의 run 길이·걸린 행 수·행 y범위를 찍는다. 진짜 12시
+        가로실선은 두꺼운 밴드라 여러 행(넓은 y범위)이 걸리고, 곡선에서 비스듬해진
+        세로차선의 오검출은 1~2행에 그친다 -> 이걸로 진짜/거짓을 판별한다. 쿨다운에
+        억제된 검출도 남겨 트리거 빈도를 본다."""
         need = max(1, int(self.get_parameter('marker_frames').value))
         if self.cooldown_left > 0:
             self.cooldown_left -= 1
@@ -236,47 +271,124 @@ class RampDetectionNode(Node):
 
         if not self.marker_active and self.marker_on >= need:
             self.marker_active = True
+            span = (f'{min(rows)}-{max(rows)}' if rows else '-')
+            nrows = len(rows) if rows else 0
             if self.cooldown_left == 0:
                 self.marker_count += 1
-                self.hold_left = int(self.get_parameter('marker_hold_frames').value)
                 self.cooldown_left = int(
                     self.get_parameter('marker_cooldown_frames').value)
+                self._dash_prev_side = None   # 새 마커 -> 점선 선택 초기화(기본 right)
+                self._last_dash_center = None  # 새 마커 -> 공백 다리 상태 초기화
+                self._dash_miss = 0
+                # 1번째 = 점선추종 시작(2번째 마커까지), 2번째 = 탈출(일반차선 복귀).
+                mode = ('점선추종 시작(2번째 마커까지)' if self.marker_count == 1
+                        else '일반차선 복귀=탈출' if self.marker_count == 2
+                        else '추가마커')
                 self.get_logger().info(
-                    f'12시 마커 통과 #{self.marker_count} -> 점선 추종 '
-                    f'{self.hold_left}프레임')
+                    f'12시 마커 통과 #{self.marker_count} -> {mode} '
+                    f'| run={best}px rows={nrows} y=[{span}]')
+            else:
+                self.get_logger().info(
+                    f'마커 감지(쿨다운 억제, cd={self.cooldown_left}) '
+                    f'run={best}px rows={nrows} y=[{span}]')
         elif self.marker_active and self.marker_off >= need:
             self.marker_active = False
 
     def follow_dashed(self, result):
-        """12시 마커 구간: `marker_follow_side` 쪽 점선에 앵커해 차로 중심을 다시 잡는다.
+        """12시 마커 구간: '노란색 발행이 적은 선'(=점선)에 앵커해 링 안에 남는다.
 
-        왜 점선인가: 12시에서 출구가 갈라진다. 실선을 물면 출구로 끌려나간다.
-        어느 쪽이 점선인지는 **이미 안다**(12시에서는 오른쪽). 검출 행 수로 추론하지
-        않는다 — 2026-07-10 실측에서 좌/우가 각각 1행씩만 잡힌 프레임(마커 잔재)이
-        동점을 만들어 반대쪽을 골랐고, lane_center 가 -36px 로 나가 offset 이 -1.000 으로
-        포화했다. 알고 있는 것을 굳이 추론하지 않는다.
+        왜 점선인가: 12시에서 출구가 갈라진다. 왼쪽 실선(픽셀 많음)을 물거나 두 선의
+        '중앙'을 잡으면 출구로 끌려나간다. 오른쪽 점선(고어, 픽셀 적음)만 계속 따라가면
+        링에 남는다. 점선은 끊겨 있어 검출 행 수가 실선보다 적다 -> 이걸로 고른다.
 
-        검출 행이 min_detect_rows 미만인 선은 차선이 아니라 잔재/노이즈이므로 안 쓴다."""
+        선택(marker_follow_side): 'auto' = 후보(≥min_detect_rows) 중 행 수가 더 적은
+        선을 점선으로. 화면 위치가 아니라 픽셀 양으로 고르므로 곡선에서 선이 좌/우로
+        넘어가도(뒤집힘) 강건하다. 'right'/'left' = 위치 고정(예전 동작).
+
+        동점 가드: 2026-07-10 실측에서 좌/우가 각각 1행씩만 잡힌 프레임(마커 잔재)이
+        동점을 만들어 반대쪽을 골랐고 offset 이 -1.000 으로 포화했다. 그래서
+        (a) 후보는 min_detect_rows 이상만, (b) 두 선이 다 후보면 행 수 차이가
+        dashed_row_margin 이상일 때만 '적은 선'을 고르고, 근소차/동점은 직전 선택을
+        유지한다."""
         side = str(self.get_parameter('marker_follow_side').value)
-        pts = result['right_pts'] if side == 'right' else result['left_pts']
-        if len(pts) < self.min_detect_rows:
-            return result       # 앵커할 점선이 없다 -> 원래 검출 결과를 그대로
+        left_pts, right_pts = result['left_pts'], result['right_pts']
+        ln, rn = len(left_pts), len(right_pts)
+        left_ok = ln >= self.min_detect_rows
+        right_ok = rn >= self.min_detect_rows
 
-        dashed_x = float(np.median([x for _, x in pts]))
-        half = self.lane_width_px / 2.0
-        # 점선이 '오른쪽 경계'면 차로 중심은 그 왼쪽 반 차선폭. 반대면 오른쪽.
-        lane_center = dashed_x - half if side == 'right' else dashed_x + half
+        # 1) 이번 프레임에 앵커할 점선을 고른다(없으면 pts=None).
+        pts, chosen = None, None
+        if side == 'dashed':
+            # 실선을 아예 빼지 않는다: 점선(끊김=행 적음)과 실선(연속=행 많음)이 둘 다 있으면
+            # **점선 우선**, 점선이 하나도 없으면 실선으로 폴백(정지 방지). 같은 부류 중에선
+            # 맨 오른쪽. -> 12시 출구에서 점선이 보이면 점선(링 유지), 점선을 놓친 프레임엔
+            # 실선이라도 잡아 계속 굴러가되, 점선이 돌아오면 다시 점선 우선.
+            solid_min = int(self.get_parameter('solid_row_min').value)
+            dashed_c, solid_c = [], []
+            if ln >= self.min_detect_rows:
+                x = float(np.median([px for _, px in left_pts]))
+                (dashed_c if ln < solid_min else solid_c).append((x, left_pts))
+            if rn >= self.min_detect_rows:
+                x = float(np.median([px for _, px in right_pts]))
+                (dashed_c if rn < solid_min else solid_c).append((x, right_pts))
+            picks = dashed_c if dashed_c else solid_c   # 점선 우선, 없으면 실선 폴백
+            if picks:
+                picks.sort(key=lambda c: c[0])          # x 오름차순
+                _, pts = picks[-1]                       # 그중 맨 오른쪽
+                chosen = 'dashed'
+        elif side in ('right', 'left'):
+            cand = right_pts if side == 'right' else left_pts
+            if len(cand) >= self.min_detect_rows:
+                pts, chosen = cand, side
+        else:  # 'auto': 노란색 적은 선(행 수 적은 선) = 점선
+            margin = int(self.get_parameter('dashed_row_margin').value)
+            if left_ok and right_ok:
+                if abs(ln - rn) >= margin:
+                    chosen = 'left' if ln < rn else 'right'
+                elif self._dash_prev_side in ('left', 'right'):
+                    chosen = self._dash_prev_side      # 애매 -> 직전 유지
+                else:
+                    chosen = 'right'                   # 기본: 12시 점선 위치
+            elif left_ok:
+                chosen = 'left'
+            elif right_ok:
+                chosen = 'right'
+            if chosen is not None:
+                pts = left_pts if chosen == 'left' else right_pts
 
         width = result['image_width']
         center_x = result['center_x']
+        # 완전 오른쪽 점선 전용(2026-07-12, 사용자 요청): 오른쪽 점선을 못 본 프레임엔
+        # 왼쪽/중앙잡기(detect_lane 결과)로 폴백하지 않는다 — 왼쪽에 끌려 안쪽으로 이탈하는
+        # 것을 막기 위함. 대신 그 프레임은 신뢰도 0 으로 둬 조향 목표를 만들지 않고(오른쪽
+        # 점선을 다시 볼 때까지 대기), 하류 페일세이프에 맡긴다. (hold/코스팅도 없음.)
+        if pts is None:
+            out = dict(result)
+            out['lane_center'] = None
+            out['raw_offset'] = 0.0
+            out['confidence'] = 0.0
+            out['left_detected'] = False
+            out['right_detected'] = False
+            out['dashed_anchored'] = False
+            out['dash_held'] = False
+            return out
+        self._dash_prev_side = chosen
+        dashed_x = float(np.median([x for _, x in pts]))
+        # 점선(고어)은 링 차로의 '오른쪽 경계' -> 차로 중심은 그 왼쪽 dash_aim_px.
+        # (예전 lane_width_px/2 대신 별도 튠값. side='left' 고정일 때만 오른쪽으로.)
+        aim = float(self.get_parameter('dash_aim_px').value)
+        lane_center = dashed_x + aim if side == 'left' else dashed_x - aim
+        held = False
+
         out = dict(result)
         out['lane_center'] = lane_center
         out['raw_offset'] = float(
             np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
-        # 점선 하나만 믿고 가는 구간이라 신뢰도에 바닥을 준다(하류 페일세이프 오정지 방지).
+        # 점선 하나만(또는 유지값) 믿고 가는 구간이라 신뢰도 바닥을 줘 페일세이프 오정지 방지.
         out['confidence'] = max(result['confidence'], 0.5)
         out['left_detected'] = out['right_detected'] = True
         out['dashed_anchored'] = True
+        out['dash_held'] = held
         return out
 
     # ------------------------------------------------------------------ decode
@@ -547,11 +659,16 @@ class RampDetectionNode(Node):
 
         # --- 12시 가로 마커: 검출 -> 랩 카운트 -> 점선 추종 hold ---
         marker_on = False
-        fill = 0.0
+        fill = 0
+        mrows = 0
         if bool(self.get_parameter('marker_enabled').value):
             rows, fill = self.marker_rows(edge)
-            marker_on = bool(rows)
-            self.update_marker(marker_on)
+            # 진짜 12시 실선(두꺼운 밴드)만 인정: run≥문턱인 행이 min_rows 이상일 때.
+            # 단일 세로선 오검출(1행)은 여기서 걸러진다.
+            min_rows = int(self.get_parameter('marker_min_rows').value)
+            marker_on = len(rows) >= min_rows
+            mrows = len(rows)
+            self.update_marker(marker_on, rows, fill)
             # 마커에 걸린 행을 지운 뒤 차선을 찾는다. 안 그러면 가로선이 한 행 전체를
             # 하나의 클러스터로 만들어 좌/우 차선 검출을 오염시킨다.
             if rows and bool(self.get_parameter('marker_exclude_rows').value):
@@ -561,10 +678,13 @@ class RampDetectionNode(Node):
 
         result = self.detect_lane(edge)
 
-        # hold 구간에는 점선(검출 행이 적은 선)에 앵커해 차로 중심을 다시 잡는다.
-        holding = self.hold_left > 0
+        # 점선(오른쪽 고어) 추종 활성 구간 = 1번째 12시 마커를 본 뒤 ~ 2번째 마커를 볼
+        # 때까지(marker_count == 1). 프레임 타임아웃(marker_hold_frames)이 아니라 마커
+        # 카운트로 유지 구간을 정한다 -> 링 한 바퀴 내내 출구로 안 새고 점선을 따라간다.
+        # 2번째 마커를 보면(marker_count >= 2) 이제는 '탈출'해야 하므로 첫 마커 전과 같은
+        # 일반 차선인지(detect_lane)로 복귀한다(follow_dashed 미적용).
+        holding = (self.marker_count == 1)
         if holding:
-            self.hold_left -= 1
             result = self.follow_dashed(result)
 
         if bool(self.get_parameter('debug_log').value):
@@ -574,11 +694,19 @@ class RampDetectionNode(Node):
                 tag += ' MARKER'
             if holding:
                 ok = result.get('dashed_anchored')
-                tag += f" DASH{'' if ok else '(없음)'} hold={self.hold_left}"
+                heldr = result.get('dash_held')
+                if heldr == 'jump':
+                    tag += f" DASH-HOLD(실선튐거부 {self._dash_miss})"
+                elif heldr == 'gap':
+                    tag += f" DASH-HOLD(공백다리 {self._dash_miss})"
+                else:
+                    tag += f" DASH{'' if ok else '(없음)'}"
+            elif self.marker_count >= 2:
+                tag += ' EXIT(일반차선복귀)'
             self.get_logger().info(
                 f"lane_width_px={self.lane_width_px:.0f} "
                 f"L={int(result['left_detected'])} R={int(result['right_detected'])} "
-                f"run={fill:3d}px mcnt={self.marker_count} "
+                f"run={fill:3d}px mrows={mrows} mcnt={self.marker_count} "
                 f"lane_center={('%.0f' % lc) if lc is not None else 'None'} "
                 f"raw_offset={result['raw_offset']:+.3f} conf={result['confidence']:.2f}{tag}",
                 throttle_duration_sec=0.5,

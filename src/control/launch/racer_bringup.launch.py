@@ -75,8 +75,13 @@ INTERPRET_PARAMS = {
     'sched_offset_hi': 0.30,  # 0.6 -> 0.30 곡선 게인 더 빨리 최대
     'steer_limit': 0.8,       # 0.7 -> 0.8 곡선 조향 범위 확대
     # 곡선 감속("코너 브레이크"): w↑ 에서 throttle 을 이 비율로 낮춰 라인 유지.
-    'curve_throttle_scale': 0.85,  # 0.9 -> 0.85 곡선 감속 약간 강화
-    'cruise_throttle': 0.0,  # SAFE: no motion until raised via param
+    'curve_throttle_scale': 0.95,  # 0.85 -> 0.95 링 곡선 감속 완화(속도 유지, 사용자 지정)
+    # 원 주행(ramp) 테스트: ramp 기본 ON + 출발속도 0.19.
+    # ramp_throttle_scale 0.6->1.0 이라 RAMP 실효속도 = cruise 그대로 0.19
+    # (07-10 링 실험이 0.17~0.19 실효였고, 사용자가 0.19 실효로 시작 지정).
+    'ramp_enabled': True,
+    'ramp_throttle_scale': 1.0,
+    'cruise_throttle': 0.19,  # 0.0 -> 0.19 (원 주행 출발속도, 사용자 지정)
 }
 
 
@@ -120,11 +125,12 @@ def generate_launch_description():
                         '— 떼려면 ros2 param set /interpret_node aruco_enabled false.',
         ),
         DeclareLaunchArgument(
-            'ramp', default_value='false',
-            description='Also start ramp_node (노란 진입로 인지). /ramp/detection 을 '
-                        '발행한다. interpret 는 ramp_enabled=false 기본이라 주행엔 영향 '
-                        '없다 — 대시보드/로그로 인지를 확인한 뒤 '
-                        'ros2 param set /interpret_node ramp_enabled true 로 켠다.',
+            'ramp', default_value='true',
+            description='Start ramp_node (노란 진입로/링 인지). /yellow/lane 을 발행하고 '
+                        'interpret 가 ramp_enabled=true(기본)로 커밋 후 노란 차선 추종한다 '
+                        '(원 주행). 인지만 보고 주행에서 떼려면 '
+                        'ros2 param set /interpret_node ramp_enabled false, '
+                        'ramp:=false 면 노드 자체를 안 띄운다.',
         ),
 
         # --- Perception + judgment/control-law + web (always) ---
