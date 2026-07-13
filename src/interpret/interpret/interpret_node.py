@@ -36,10 +36,11 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 import yaml
 
 from interface.msg import Control, DetectionArray, LaneDetection, LaneInfo
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 
 
 def get_default_vehicle_config_path():
@@ -88,6 +89,13 @@ class Judgment:
         # (순간 게이트가 아니라 '상태' — 초록불을 봐야 출발, 그전엔 계속 정지)
         self.traffic_light_enabled = bool(node.get_parameter('traffic_light_enabled').value)
         self.traffic_stop = False
+        # 출발 게이트: 런치 직후엔 throttle 0 으로 정지해 있다가, 초록불을 '확정'한 순간
+        # 해제(래치)해 출발한다. 해제 후엔 다시 잠기지 않는다(이후엔 red/green 래치가 관장).
+        # 확정 = 강한 초록(conf≥green_start_confidence)이 green_start_frames 연속 — 오검출
+        # 1~2프레임에 안 풀리게 디바운스한다.
+        self.started = False
+        self._green_run = 0          # 강한 초록 연속 프레임 카운터(출발 게이트 디바운스)
+        self._last_green_conf = 0.0  # 최근 프레임 초록 최고 conf(로그 가시화용)
         # 방향표지 바이어스 상태(Y자 갈래 선택): sign_dir +1/-1/0 래치, 근접 마지막 시각.
         self.sign_bias_enabled = bool(node.get_parameter('sign_bias_enabled').value)
         self.sign_dir = 0
@@ -132,6 +140,7 @@ class Judgment:
         slow = False
         saw_red = False
         saw_green = False
+        green_conf = 0.0
         for d in msg.detections:
             if float(d.confidence) < min_conf:
                 continue
@@ -141,6 +150,7 @@ class Judgment:
                 saw_red = True
             elif d.label == green_label:
                 saw_green = True
+                green_conf = max(green_conf, float(d.confidence))
             # 일반 정지/감속(사람 등)은 근접(면적) 게이트 적용 — 멀리서 조기반응 방지.
             if (float(d.width) * float(d.height)) / img_area < min_area:
                 continue
@@ -152,11 +162,29 @@ class Judgment:
         self.yolo_slow = slow
         # 신호등 래치: 빨간불 보이면 정지, 초록불 보이면 출발, 둘 다 안 보이면 마지막 상태
         # 유지. red 가 green 보다 우선(애매하면 안전하게 정지).
+        self._last_green_conf = green_conf
         if self.traffic_light_enabled:
             if saw_red:
                 self.traffic_stop = True
+                self._green_run = 0
             elif saw_green:
                 self.traffic_stop = False
+                # 출발 게이트 해제는 엄격하게: 강한 초록(conf≥green_start_confidence)이
+                # green_start_frames 프레임 연속 잡혀야 확정. 오검출 1~2프레임엔 안 풀린다.
+                if green_conf >= float(gp('green_start_confidence').value):
+                    self._green_run += 1
+                else:
+                    self._green_run = 0
+                if (not self.started
+                        and self._green_run >= int(gp('green_start_frames').value)):
+                    self.started = True   # 초록불 확정 -> 출발 게이트 영구 해제
+                    self.node.get_logger().info(
+                        '출발 게이트 해제: 초록불 확정(conf=%.2f, %d프레임 연속)'
+                        % (green_conf, self._green_run))
+                    if bool(gp('yolo_power_gate').value):
+                        self.node.set_yolo_active(False)   # 출발과 동시에 YOLO off
+            else:
+                self._green_run = 0   # 초록 끊기면 카운터 리셋(연속 요구)
 
         # 방향표지 near-gate + 래치: left/right 표지판이 '가까우면'(박스 높이비 ≥ 문턱)
         # 그 방향으로 래치하고 근접 시각 갱신(hold 해제 타이머용). 멀면 무시(미리 안 꺾게).
@@ -192,6 +220,12 @@ class Judgment:
         gp = self.node.get_parameter
         stop = False
         slow = False
+        # 출발 게이트: 첫 초록불을 아직 못 봤으면 무조건 정지(YOLO 첫 메시지 도착 전에도
+        # 적용 — 런치 직후 오출발 방지). YOLO+신호등이 켜져 있을 때만 — 꺼져 있으면
+        # (예: 초록불 없는 벤치/링 테스트) 게이트 미적용해 즉시 주행한다.
+        if (bool(gp('require_green_start').value) and self.yolo_enabled
+                and self.traffic_light_enabled and not self.started):
+            stop = True
         if self.yolo_enabled and self.last_yolo_time is not None:
             age = (now - self.last_yolo_time).nanoseconds * 1e-9
             if age <= float(gp('yolo_stop_timeout_sec').value):
@@ -229,6 +263,10 @@ class Judgment:
             tag += ' yolo=' + ('STOP' if self.yolo_stop else 'slow' if self.yolo_slow else '-')
             if self.traffic_light_enabled:
                 tag += ' signal=' + ('RED(stop)' if self.traffic_stop else 'GREEN(go)')
+                # 출발 게이트 상태 가시화: 아직 대기면 연속카운트·초록 conf 를 보여준다
+                # (오검출 원인 진단용). started 후엔 표시 안 함.
+                if not self.started:
+                    tag += ' START=HELD(g%d,c%.2f)' % (self._green_run, self._last_green_conf)
         if self.aruco_enabled and self.aruco_stop:
             tag += ' aruco=STOP'
         if self.sign_bias_enabled and self.sign_dir != 0:
@@ -608,8 +646,23 @@ class InterpretNode(Node):
         # 빨간불이 잠깐 가려져도(각도/가림) 초록불을 볼 때까지 계속 정지(안전).
         # 라벨은 yolo_min_confidence / yolo_min_box_area_ratio 문턱을 공유한다.
         self.declare_parameter('traffic_light_enabled', True)
+        # 출발 게이트: True 면 런치 직후 정지해 있다가 첫 초록불을 봐야 출발한다.
+        # (yolo_enabled & traffic_light_enabled 가 모두 켜져 있을 때만 유효.)
+        # 초록불 없는 곳에서 바로 굴리려면 False 로: ros2 param set /interpret_node require_green_start false
+        self.declare_parameter('require_green_start', True)
+        # 출발 게이트 해제 조건(오검출 방어): 강한 초록 conf 문턱 + 연속 프레임 수.
+        # 오검출로 바로 출발하면 conf 를 올리거나 frames 를 늘린다(로그의 START=HELD 참고).
+        self.declare_parameter('green_start_confidence', 0.60)
+        # 10 = 오검출(실측 최대 4연속)을 확실히 거른다. 진짜 초록불은 연속 잡히니 여유.
+        self.declare_parameter('green_start_frames', 10)
         self.declare_parameter('red_label', 'red_light')
         self.declare_parameter('green_label', 'green_light')
+        # YOLO 전원 게이트(자동 on/off로 CPU 절약): 초록불 출발 순간 off, ArUco 마커
+        # 인지 시 on. False 면 이 자동 게이팅을 끈다(YOLO 계속 켜둠 — 링/벤치 테스트).
+        self.declare_parameter('yolo_power_gate', True)
+        self.declare_parameter('yolo_active_topic', '/yolo/active')
+        self.declare_parameter('marker_id_topic', '/detected_marker_id')
+        self.declare_parameter('yolo_wake_marker_id', -1)  # -1=아무 마커나 재가동, ≥0=해당 ID만
 
         # --- ArUco 마커 연동(정지) -----------------------------------------
         # aruco_node 의 /aruco_stop(Bool, 이미 디바운스됨)을 구독해 True 면 정지시킨다.
@@ -667,6 +720,17 @@ class InterpretNode(Node):
         self.lane_pub = self.create_publisher(LaneInfo, lane_topic, 10)
         self.control_pub = self.create_publisher(Control, control_topic, 10)
 
+        # YOLO 전원 게이트 발행(/yolo/active). latched(transient_local) 라 yolo_node 가
+        # 늦게 떠도 마지막 명령을 받는다. 초록불 출발 시 off, ArUco 마커 인지 시 on.
+        gate_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST, depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.yolo_active_pub = self.create_publisher(
+            Bool, str(self.get_parameter('yolo_active_topic').value), gate_qos)
+        self._yolo_active_cmd = True   # 현재 YOLO 전원 명령 상태(중복 발행 방지)
+
         # YOLO 검출 구독(정지/감속 게이팅용). 항상 구독하되 gate 는 yolo_enabled 로 제어.
         self.yolo_sub = self.create_subscription(
             DetectionArray,
@@ -680,6 +744,14 @@ class InterpretNode(Node):
             Bool,
             str(self.get_parameter('aruco_stop_topic').value),
             self.aruco_callback,
+            10,
+        )
+
+        # ArUco 마커 ID 구독(/detected_marker_id). 마커를 보면 YOLO 전원을 다시 켠다.
+        self.marker_sub = self.create_subscription(
+            Int32,
+            str(self.get_parameter('marker_id_topic').value),
+            self.marker_callback,
             10,
         )
 
@@ -789,6 +861,27 @@ class InterpretNode(Node):
 
     def aruco_callback(self, msg: Bool):
         self.judgment.on_aruco(msg)
+
+    def marker_callback(self, msg: Int32):
+        """ArUco 마커 인지 -> YOLO 전원 재가동. yolo_wake_marker_id≥0 이면 그 ID만."""
+        if not bool(self.get_parameter('yolo_power_gate').value):
+            return
+        wake = int(self.get_parameter('yolo_wake_marker_id').value)
+        if wake >= 0 and int(msg.data) != wake:
+            return
+        self.set_yolo_active(True)
+
+    def set_yolo_active(self, on):
+        """YOLO 전원 게이트 명령(/yolo/active). 상태가 바뀔 때만 발행(중복 방지)."""
+        on = bool(on)
+        if on == self._yolo_active_cmd:
+            return
+        self._yolo_active_cmd = on
+        m = Bool()
+        m.data = on
+        self.yolo_active_pub.publish(m)
+        self.get_logger().info(
+            'YOLO 전원 -> %s' % ('ON (ArUco 마커)' if on else 'OFF (초록불 출발)'))
 
     # ------------------------------------------------------------------ config
     def load_steer_trim(self):

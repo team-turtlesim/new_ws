@@ -23,8 +23,9 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool
 
 from interface.msg import Detection, DetectionArray
 
@@ -80,6 +81,12 @@ class YoloNode(Node):
         # N 프레임마다 1번만 추론(나머지 프레임은 스킵). CPU 여유 확보용. 1=매 프레임.
         self.declare_parameter('infer_every_n', 1)
 
+        # 전원 게이트: active=False 면 추론·발행을 통째로 건너뛴다(CPU 확보). 모델은
+        # 로드된 채라 재개 시 재로딩 없음. /yolo/active(Bool) 토픽으로 런타임 토글
+        # (interpret 가 초록불 출발 시 off, ArUco 마커 인지 시 on 을 발행).
+        self.declare_parameter('active', True)
+        self.declare_parameter('active_topic', '/yolo/active')
+
         # --- 디버그 오버레이 ------------------------------------------------
         self.declare_parameter('debug_image', True)
         self.declare_parameter('jpeg_quality', 80)
@@ -95,6 +102,7 @@ class YoloNode(Node):
         self.input_size = int(self.get_parameter('input_size').value)
         self.num_threads = int(self.get_parameter('num_threads').value)
         self.infer_every_n = max(1, int(self.get_parameter('infer_every_n').value))
+        self.active = bool(self.get_parameter('active').value)
         self.debug_image = bool(self.get_parameter('debug_image').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         if not 0 <= self.jpeg_quality <= 100:
@@ -140,6 +148,18 @@ class YoloNode(Node):
 
         self.subscription = self.create_subscription(
             CompressedImage, subscribe_topic, self.image_callback, infer_qos
+        )
+
+        # 전원 게이트 구독. latched(transient_local) 라 나중에 떠도 마지막 명령을 받는다.
+        active_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.active_sub = self.create_subscription(
+            Bool, str(self.get_parameter('active_topic').value),
+            self.on_active, active_qos
         )
 
         self._frame_count = 0
@@ -188,7 +208,18 @@ class YoloNode(Node):
             return None
 
     # ------------------------------------------------------------------ callbk
+    def on_active(self, msg: Bool):
+        """전원 게이트 토글(/yolo/active). 상태가 바뀔 때만 로그."""
+        new_active = bool(msg.data)
+        if new_active != self.active:
+            self.get_logger().info(
+                'YOLO 추론 %s' % ('재개(on)' if new_active else '일시정지(off, CPU 확보)'))
+        self.active = new_active
+
     def image_callback(self, msg: CompressedImage):
+        # 전원 게이트: 꺼져 있으면 디코드·추론·발행 전부 건너뛴다(CPU 확보).
+        if not self.active:
+            return
         self._frame_count += 1
         # 프레임 솎기: 스킵하는 프레임은 추론/발행을 건너뛴다(CPU 여유).
         if (self._frame_count % self.infer_every_n) != 0:

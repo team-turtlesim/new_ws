@@ -130,14 +130,14 @@ def generate_launch_description():
             description='Point the monitor edge pane at the lane debug overlay.',
         ),
         DeclareLaunchArgument(
-            'yolo', default_value='false',
+            'yolo', default_value='true',
             description='Also start yolo_node (object detection) + show its overlay '
                         'pane on the dashboard. interpret 가 yolo_enabled=true 기본이라 '
                         '검출이 제어에 물린다(신호등 정지/출발, 방향표지 바이어스) — 표시만 '
                         '하려면 ros2 param set /interpret_node yolo_enabled false 로 끈다.',
         ),
         DeclareLaunchArgument(
-            'aruco', default_value='false',
+            'aruco', default_value='true',
             description='Also start aruco_node (ArUco 마커 검출) + show its overlay '
                         'pane on the dashboard. /detected_marker_id + /aruco_stop 를 '
                         '발행하고, interpret 가 aruco_enabled=true 기본이라 정지에 물린다 '
