@@ -257,9 +257,16 @@ class RampEntry:
 
     def __init__(self, node):
         self.node = node
-        self.state = 'WAIT'
+        # 시작 상태: 기본은 WAIT(흰차선 주행→노랑 커밋시 RAMP). 링 위에서 출발할 땐
+        # ramp_start_state:=RAMP 로 부팅해 WAIT 를 건너뛰고 첫 프레임부터 노란 차선 추종.
+        start = str(node.get_parameter('ramp_start_state').value).upper()
+        self.state = 'RAMP' if start == 'RAMP' else 'WAIT'
         self.moving_sec = 0.0        # 실제로 굴러간 시간(무장 타이머 기준)
-        self.armed = False
+        # 링 출발(RAMP 부팅)이면 arm_delay·커밋 가드를 건너뛴다(이미 노란 구간 위이므로).
+        self.armed = (self.state == 'RAMP')
+        if self.state == 'RAMP':
+            node.get_logger().info(
+                'ramp: RAMP 상태로 부팅(링 출발) — 흰차선 WAIT 단계 건너뜀')
         self.cue_frames = 0          # APPROACH 진입 디바운스
         self.commit_frames = 0       # RAMP 커밋 디바운스
         self.degrade_frames = 0      # 후퇴 디바운스
@@ -536,6 +543,9 @@ class InterpretNode(Node):
         # 무장: 실제로 굴러간 시간이 이만큼 지나야 감지 시작(출발선 근처 오탐 차단).
         # 램프 바로 앞에서 출발시킬 땐 짧게 줄일 것(안 그러면 무장 전에 분기를 지나친다).
         self.declare_parameter('arm_delay_sec', 3.0)
+        # 시작 상태 선택. 'WAIT'(기본): 흰차선부터 시작해 노랑 커밋시 RAMP 전환.
+        # 'RAMP': 링 위에서 출발 — WAIT/arm_delay/커밋 가드를 건너뛰고 노란차선 즉시 추종.
+        self.declare_parameter('ramp_start_state', 'WAIT')
 
         # 커밋: 노란 차선이 이만큼 잡히면 곧장 RAMP. 흰 차선으로 후퇴는 없다.
         # 커밋은 되돌릴 수 없으므로 '스치는 노란 선'과 '진짜 램프'를 신뢰도로 가른다.

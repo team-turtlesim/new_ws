@@ -136,7 +136,14 @@ class RampDetectionNode(Node):
         # 오른쪽을 고른다. 'right'/'left'=위치 고정, 'auto'=행 적은 선 자동(점선2개면 불안정).
         self.declare_parameter('marker_follow_side', 'dashed')
         # 이 행 수 이상 검출되면 '실선'으로 보고 점선 후보에서 제외(num_scan_rows=12 기준).
-        self.declare_parameter('solid_row_min', 8)
+        # 낮출수록 '실선'으로 판정되는 선이 많아져 실선을 점선으로 오인하는 경우가 준다.
+        # (행수 < 이 값 = 점선, 이상 = 실선.) HUD 의 실측 행수 보고 실선/점선 사이로 맞출 것.
+        self.declare_parameter('solid_row_min', 6)
+        # 마커 구간(mcnt==1) 전용 다중선 검출. True 면 좌/우 2트랙 한계를 풀고 노란 선을
+        # N개 다 잡아(안쪽 점선/고어 점선/바깥 실선 등) 그중 점선 우선·맨 오른쪽을 고른다.
+        # 마커 구간에서만 켜지므로 흰 차선·일반/탈출 인지(2트랙)는 그대로다. 출구선 배제
+        # 가드(기울기/라인락)는 아직 없음 -> HUD 로 출구선 물는지 보고 필요하면 추가.
+        self.declare_parameter('ring_multiline', True)
         # 점선에서 '얼마나 왼쪽(안쪽)을 겨냥할지'(px). 예전엔 lane_width_px/2(≈99)를 썼는데
         # lane_width_px 학습이 오염돼(≈198, 실제 간격 ~85) 목표가 과도하게 왼쪽으로 쏠렸다.
         # 이 값으로 분리해 직접 튜닝한다(작을수록 점선에 더 붙어 감).
@@ -294,8 +301,50 @@ class RampDetectionNode(Node):
         elif self.marker_active and self.marker_off >= need:
             self.marker_active = False
 
-    def follow_dashed(self, result):
+    def scan_all_lines(self, edge):
+        """마커 구간 전용: 좌/우 2트랙 한계를 풀어 노란 세로선을 N개 다 잡는다.
+        detect_lane 의 scan_lanes 는 좌/우 딱 2개만 추적하지만, 12시 출구엔 안쪽 점선·
+        고어 점선·바깥 실선이 함께 보일 수 있다. 여기선 행별 클러스터(row_clusters)를
+        x-근접(track_tol)으로 여러 세로선에 묶어 후보를 전부 만든다. 반환: [[(y,x),...], ...]
+        (각 선의 점열; x 는 클러스터 중앙). marker_exclude_rows 로 마커행이 이미 지워진
+        edge 를 받으므로 가로선은 안 섞인다."""
+        height, width = edge.shape
+        roi_top = min(max(int(self.get_parameter('roi_top').value), 0), height - 1)
+        roi_left = min(max(int(self.get_parameter('roi_left').value), 0), width - 1)
+        cluster_gap = float(self.get_parameter('cluster_gap_px').value)
+        track_tol = float(self.get_parameter('track_tol_px').value)
+        scan_ys = np.linspace(roi_top, height - 1, self.num_scan_rows).astype(int)
+
+        lines = []   # 각 원소: {'pts': [(y, x), ...], 'ref': 직전 행 x}
+        for y in sorted({int(v) for v in scan_ys}, reverse=True):   # 근거리(하단)부터
+            clusters = self.row_clusters(edge[y], roi_left, cluster_gap)
+            if not clusters:
+                continue
+            used = set()
+            # 1) 기존 선 추적: 각 선을 가장 가까운 미사용 클러스터에 track_tol 내 매칭
+            for line in lines:
+                best_j, best_d = None, track_tol
+                for j, c in enumerate(clusters):
+                    if j in used:
+                        continue
+                    d = abs(c[0] - line['ref'])
+                    if d <= best_d:
+                        best_d, best_j = d, j
+                if best_j is not None:
+                    line['pts'].append((y, int(round(clusters[best_j][0]))))
+                    line['ref'] = clusters[best_j][0]
+                    used.add(best_j)
+            # 2) 미사용 클러스터는 새 세로선으로 시작
+            for j, c in enumerate(clusters):
+                if j not in used:
+                    lines.append({'pts': [(y, int(round(c[0])))], 'ref': c[0]})
+        return [line['pts'] for line in lines]
+
+    def follow_dashed(self, result, lines=None):
         """12시 마커 구간: '노란색 발행이 적은 선'(=점선)에 앵커해 링 안에 남는다.
+
+        lines(마커 구간 다중선 후보)가 주어지면 좌/우 2트랙 대신 그 N개 선을 후보로
+        삼는다(side='dashed' 에서만). 없으면 기존 좌/우 2트랙으로 동작(하위호환).
 
         왜 점선인가: 12시에서 출구가 갈라진다. 왼쪽 실선(픽셀 많음)을 물거나 두 선의
         '중앙'을 잡으면 출구로 끌려나간다. 오른쪽 점선(고어, 픽셀 적음)만 계속 따라가면
@@ -316,6 +365,9 @@ class RampDetectionNode(Node):
         left_ok = ln >= self.min_detect_rows
         right_ok = rn >= self.min_detect_rows
 
+        # 판단 근거 기록(대시보드 HUD 용): 각 선의 행수·점선/실선 분류.
+        dbg_lines = []
+
         # 1) 이번 프레임에 앵커할 점선을 고른다(없으면 pts=None).
         pts, chosen = None, None
         if side == 'dashed':
@@ -325,12 +377,23 @@ class RampDetectionNode(Node):
             # 실선이라도 잡아 계속 굴러가되, 점선이 돌아오면 다시 점선 우선.
             solid_min = int(self.get_parameter('solid_row_min').value)
             dashed_c, solid_c = [], []
-            if ln >= self.min_detect_rows:
-                x = float(np.median([px for _, px in left_pts]))
-                (dashed_c if ln < solid_min else solid_c).append((x, left_pts))
-            if rn >= self.min_detect_rows:
-                x = float(np.median([px for _, px in right_pts]))
-                (dashed_c if rn < solid_min else solid_c).append((x, right_pts))
+            # 후보: 마커 구간 다중선(lines)이 있으면 N개, 없으면 좌/우 2트랙.
+            if lines is not None:
+                cand = [(pts_, len(pts_)) for pts_ in lines]
+            else:
+                cand = [(left_pts, ln), (right_pts, rn)]
+            for pts_, n in cand:
+                if n < self.min_detect_rows:
+                    continue
+                kind = 'solid' if n >= solid_min else 'dash'   # 실선=연속(행 많음), 점선=끊김
+                x = float(np.median([px for _, px in pts_]))
+                if lines is not None:
+                    side_lbl = f'x{int(round(x))}'             # 다중선: 위치(x)로 라벨
+                else:
+                    side_lbl = 'L' if pts_ is left_pts else 'R'
+                dbg_lines.append({'side': side_lbl, 'rows': n, 'slope': None,
+                                  'kind': kind, 'rejected': False, 'x': x})
+                (dashed_c if n < solid_min else solid_c).append((x, pts_))
             picks = dashed_c if dashed_c else solid_c   # 점선 우선, 없으면 실선 폴백
             if picks:
                 picks.sort(key=lambda c: c[0])          # x 오름차순
@@ -362,6 +425,7 @@ class RampDetectionNode(Node):
         # 왼쪽/중앙잡기(detect_lane 결과)로 폴백하지 않는다 — 왼쪽에 끌려 안쪽으로 이탈하는
         # 것을 막기 위함. 대신 그 프레임은 신뢰도 0 으로 둬 조향 목표를 만들지 않고(오른쪽
         # 점선을 다시 볼 때까지 대기), 하류 페일세이프에 맡긴다. (hold/코스팅도 없음.)
+        ring_dbg = {'lines': dbg_lines, 'chosen': chosen, 'anchor_x': None, 'aim': None}
         if pts is None:
             out = dict(result)
             out['lane_center'] = None
@@ -371,6 +435,7 @@ class RampDetectionNode(Node):
             out['right_detected'] = False
             out['dashed_anchored'] = False
             out['dash_held'] = False
+            out['ring_dbg'] = ring_dbg
             return out
         self._dash_prev_side = chosen
         dashed_x = float(np.median([x for _, x in pts]))
@@ -389,6 +454,9 @@ class RampDetectionNode(Node):
         out['left_detected'] = out['right_detected'] = True
         out['dashed_anchored'] = True
         out['dash_held'] = held
+        ring_dbg['anchor_x'] = dashed_x
+        ring_dbg['aim'] = aim
+        out['ring_dbg'] = ring_dbg
         return out
 
     # ------------------------------------------------------------------ decode
@@ -683,9 +751,31 @@ class RampDetectionNode(Node):
         # 카운트로 유지 구간을 정한다 -> 링 한 바퀴 내내 출구로 안 새고 점선을 따라간다.
         # 2번째 마커를 보면(marker_count >= 2) 이제는 '탈출'해야 하므로 첫 마커 전과 같은
         # 일반 차선인지(detect_lane)로 복귀한다(follow_dashed 미적용).
+        # [진단] mcnt 와 무관하게 다중선 행수를 로그로 찍어 solid_row_min(실선/점선 경계)
+        # 튜닝을 돕는다. debug_log 켜졌을 때만. (임시 — 튜닝 끝나면 제거 가능)
+        if bool(self.get_parameter('debug_log').value) and bool(
+                self.get_parameter('ring_multiline').value):
+            solid_min = int(self.get_parameter('solid_row_min').value)
+            diag = []
+            for pts in self.scan_all_lines(edge):
+                if len(pts) < self.min_detect_rows:
+                    continue
+                nrow = len(pts)
+                mx = int(np.median([x for _, x in pts]))
+                diag.append(f"x{mx}:{nrow}r/{'SOLID' if nrow >= solid_min else 'dash'}")
+            self.get_logger().info(
+                f"[multiline] mcnt={self.marker_count} solid_min={solid_min} "
+                f"lines=[{', '.join(diag) if diag else 'none'}]",
+                throttle_duration_sec=0.5)
+
         holding = (self.marker_count == 1)
         if holding:
-            result = self.follow_dashed(result)
+            # 마커 구간에만 다중선 후보를 만든다(흰 차선·일반/탈출 인지는 2트랙 그대로).
+            lines = self.scan_all_lines(edge) if bool(
+                self.get_parameter('ring_multiline').value) else None
+            result = self.follow_dashed(result, lines=lines)
+            if lines is not None:
+                result['ring_lines'] = lines   # 오버레이가 다중선을 그릴 수 있게 전달
 
         if bool(self.get_parameter('debug_log').value):
             lc = result['lane_center']
@@ -731,6 +821,18 @@ class RampDetectionNode(Node):
             self.publish_debug(edge, result, msg)
 
     # ------------------------------------------------------------------- debug
+    def draw_curve(self, canvas, pts, color, thick):
+        """검출점(y,x)들을 y순으로 이어 곡선으로 그린다(직선 피팅 대신 실제 차선 모양).
+        점도 함께 찍어 어디가 잡혔는지 보이게 한다. 차선을 따라 휘어 보인다."""
+        if not pts:
+            return
+        ordered = sorted(pts)                       # (y, x) -> y 오름차순
+        if len(ordered) >= 2:
+            arr = np.array([[int(x), int(y)] for y, x in ordered], dtype=np.int32)
+            cv2.polylines(canvas, [arr], False, color, thick)
+        for y, x in pts:
+            cv2.circle(canvas, (int(x), int(y)), 2, color, -1)
+
     def publish_debug(self, edge, result, source_msg: CompressedImage):
         canvas = cv2.cvtColor(edge, cv2.COLOR_GRAY2BGR)
         height, width = edge.shape
@@ -741,24 +843,36 @@ class RampDetectionNode(Node):
         cv2.line(canvas, (0, roi_top), (width, roi_top), (0, 255, 255), 1)
         # 이미지 중심선(흰색)
         cv2.line(canvas, (center_x, 0), (center_x, height), (255, 255, 255), 1)
-        # 좌/우 차선 검출점(좌=빨강, 우=파랑) — 참고용 작은 점
-        for y, x in result['left_pts']:
-            cv2.circle(canvas, (x, y), 1, (0, 0, 255), -1)
-        for y, x in result['right_pts']:
-            cv2.circle(canvas, (x, y), 1, (255, 0, 0), -1)
-        # 피팅된 차선 곡선(좌=빨강, 우=파랑) — 정교한 실선
-        for poly, color in ((result.get('left_poly'), (0, 0, 255)),
-                            (result.get('right_poly'), (255, 0, 0))):
-            if poly is None:
-                continue
-            ys = np.arange(roi_top, height)
-            xs = np.clip(poly(ys), 0, width - 1).astype(np.int32)
-            pts_line = np.stack([xs, ys.astype(np.int32)], axis=1)
-            cv2.polylines(canvas, [pts_line], False, color, 2)
+        ring_lines = result.get('ring_lines')
+        if ring_lines:
+            # 마커 구간 다중선: 검출한 노란 선을 '전부' 곡선으로 그린다(차선 따라 휨).
+            #   초록=점선(따라갈 후보), 주황=실선, 자홍(굵게)=지금 실제로 따라가는 선.
+            ring = result.get('ring_dbg') or {}
+            anchor_x = ring.get('anchor_x')
+            solid_min = int(self.get_parameter('solid_row_min').value)
+            for pts in ring_lines:
+                if len(pts) < self.min_detect_rows:
+                    continue
+                n = len(pts)
+                mx = float(np.median([x for _, x in pts]))
+                if anchor_x is not None and abs(mx - anchor_x) < 3.0:
+                    color, thick = (255, 0, 255), 2      # 따라가는 선(앵커)
+                elif n < solid_min:
+                    color, thick = (0, 255, 0), 1        # 점선
+                else:
+                    color, thick = (255, 180, 0), 1      # 실선
+                self.draw_curve(canvas, pts, color, thick)
+        else:
+            # 일반(2트랙): 좌=빨강, 우=파랑. 실제 검출점을 이어 곡선으로(차선 따라 휨).
+            self.draw_curve(canvas, result['left_pts'], (0, 0, 255), 2)
+            self.draw_curve(canvas, result['right_pts'], (255, 0, 0), 2)
         # 차선 중심선(초록)
         if result['lane_center'] is not None:
             lc = int(result['lane_center'])
             cv2.line(canvas, (lc, roi_top), (lc, height), (0, 255, 0), 2)
+
+        # 판단 HUD: 링 상태 + 점선/실선 분류 + 따라가는 선(앵커)
+        self.draw_ring_hud(canvas, result)
 
         ok, encoded = cv2.imencode(
             '.jpg', canvas, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
@@ -771,6 +885,71 @@ class RampDetectionNode(Node):
         out.format = 'jpeg'
         out.data = encoded.tobytes()
         self.debug_pub.publish(out)
+
+    def draw_ring_hud(self, canvas, result):
+        """대시보드용 판단 HUD. ramp_node 가 매 프레임 내리는 링 판단을 화면에 그린다:
+          - 링 상태(WAIT 1st marker / RING DASH-FOLLOW / EXIT)  ← 마커 카운트로 결정
+          - 각 노란 선의 [행수 + 점선/실선(DASH/SOLID) + 기울기 + 배제(REJ)]
+          - 실제로 따라가는 선(앵커, 자홍색 세로선 + FOLLOW)
+        holding 이 아니어도(마커 전/탈출) 행수 기반 점선/실선 분류는 늘 보여준다."""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        h, w = canvas.shape[:2]
+        solid_min = int(self.get_parameter('solid_row_min').value)
+
+        mcnt = self.marker_count
+        if mcnt == 0:
+            state, scolor = 'WAIT(1st marker)', (200, 200, 200)
+        elif mcnt == 1:
+            state, scolor = 'RING: DASH-FOLLOW', (0, 255, 255)
+        else:
+            state, scolor = 'EXIT(normal lane)', (0, 255, 0)
+        y = 11
+        cv2.putText(canvas, f'mcnt={mcnt} {state}', (3, y), font, 0.36,
+                    (0, 0, 0), 3, cv2.LINE_AA)   # 검은 외곽(가독성)
+        cv2.putText(canvas, f'mcnt={mcnt} {state}', (3, y), font, 0.36,
+                    scolor, 1, cv2.LINE_AA)
+
+        # 선별 분류: follow_dashed 가 남긴 근거(ring_dbg) 우선, 없으면 행수로 즉석 분류.
+        ring = result.get('ring_dbg')
+        lines = list(ring['lines']) if ring and ring.get('lines') else None
+        if not lines:
+            lines = []
+            ln, rn = len(result.get('left_pts') or []), len(result.get('right_pts') or [])
+            if ln >= self.min_detect_rows:
+                lines.append({'side': 'L', 'rows': ln, 'slope': None,
+                              'kind': 'solid' if ln >= solid_min else 'dash',
+                              'rejected': False})
+            if rn >= self.min_detect_rows:
+                lines.append({'side': 'R', 'rows': rn, 'slope': None,
+                              'kind': 'solid' if rn >= solid_min else 'dash',
+                              'rejected': False})
+        for ln_dbg in lines:
+            y += 12
+            txt = f"{ln_dbg['side']}: {ln_dbg['rows']}r {ln_dbg['kind'].upper()}"
+            if ln_dbg.get('slope') is not None:
+                txt += f" s={ln_dbg['slope']:+.2f}"
+            if ln_dbg.get('rejected'):
+                txt += ' xREJ'
+                color = (0, 0, 255)                      # 배제 선 = 빨강
+            elif ln_dbg['kind'] == 'dash':
+                color = (0, 255, 0)                      # 점선 = 초록(따라갈 후보)
+            else:
+                color = (255, 180, 0)                    # 실선 = 주황
+            cv2.putText(canvas, txt, (3, y), font, 0.33, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(canvas, txt, (3, y), font, 0.33, color, 1, cv2.LINE_AA)
+
+        # 실제로 따라가는 앵커 선(자홍색). 점선을 물었다면 여기에 세로선이 뜬다.
+        if ring and ring.get('anchor_x') is not None:
+            ax = int(np.clip(ring['anchor_x'], 0, w - 1))
+            cv2.line(canvas, (ax, 0), (ax, h), (255, 0, 255), 1)
+            cv2.putText(canvas, 'FOLLOW', (max(0, min(ax + 2, w - 48)), h - 4),
+                        font, 0.33, (255, 0, 255), 1, cv2.LINE_AA)
+
+        # 최종 조향 목표값
+        y += 12
+        txt = f"off={result['raw_offset']:+.2f} conf={result['confidence']:.2f}"
+        cv2.putText(canvas, txt, (3, y), font, 0.33, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(canvas, txt, (3, y), font, 0.33, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def main(args=None):

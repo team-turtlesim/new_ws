@@ -85,6 +85,24 @@ INTERPRET_PARAMS = {
 }
 
 
+# ramp_node(노란 차선/링 인지) 튜닝 파라미터. 노드 declare_parameter 기본값을 런치에서
+# 한눈에 관리·오버라이드한다. 값은 노드 기본값과 동일(동작 불변) — 여기서 바꾸면 적용된다.
+# 라이브 튜닝은 여전히 `ros2 param set /ramp_detection_node <이름> <값>` 으로 가능.
+RAMP_PARAMS = {
+    # --- 12시 마커 검출/카운트 ---
+    'marker_enabled': True,
+    'marker_run_px': 120,        # 한 행 연속 노란 런이 이 px 이상이면 가로 마커 후보
+    'marker_min_rows': 3,        # run≥문턱 행이 이만큼 이상이어야 진짜 마커(오검출 배제)
+    'marker_cooldown_frames': 90,  # 마커 한 번 센 뒤 이 프레임 동안 재카운트 금지(≈3초)
+    # --- 점선 추종(마커 구간, mcnt==1) ---
+    'marker_follow_side': 'dashed',  # 실선 제외·점선 중 맨 오른쪽
+    'solid_row_min': 6,          # 행수<이 값=점선, ≥=실선. 낮출수록 실선→점선 오인 감소
+    'dash_aim_px': 45,           # 점선을 오른쪽 경계로 보고 차로 중심을 그 왼쪽 이 px 로
+    'ring_multiline': True,      # 마커 구간 다중선 검출(좌/우 2트랙 한계 해제)
+    'debug_log': False,          # per-frame 링 판단 로그(마커/점선 선택) — 필요 시 true
+}
+
+
 def generate_launch_description():
     vehicle_config_path = get_vehicle_config_path()
     cfg = {'vehicle_config_file': vehicle_config_path}
@@ -94,6 +112,7 @@ def generate_launch_description():
     yolo = LaunchConfiguration('yolo')
     aruco = LaunchConfiguration('aruco')
     ramp = LaunchConfiguration('ramp')
+    ramp_start = LaunchConfiguration('ramp_start')
 
     # monitor "edge" pane topic: lane overlay when debug_overlay, else raw edge.
     edge_topic = PythonExpression([
@@ -132,6 +151,12 @@ def generate_launch_description():
                         'ros2 param set /interpret_node ramp_enabled false, '
                         'ramp:=false 면 노드 자체를 안 띄운다.',
         ),
+        DeclareLaunchArgument(
+            'ramp_start', default_value='WAIT',
+            description='interpret 의 램프 시작 상태. WAIT(기본): 흰차선부터 시작해 '
+                        '노랑 커밋시 RAMP 전환. RAMP: 링 위에서 출발 — arm_delay/커밋 '
+                        '가드를 건너뛰고 노란차선을 첫 프레임부터 추종(링 출발 테스트).',
+        ),
 
         # --- Perception + judgment/control-law + web (always) ---
         Node(package='camera', executable='camera_node', name='camera_node',
@@ -144,7 +169,7 @@ def generate_launch_description():
         #            -> LaneInfo(디버그) + Control(/control). 이벤트구동.
         Node(package='interpret', executable='interpret_node',
              name='interpret_node', output='screen',
-             parameters=[cfg, INTERPRET_PARAMS]),
+             parameters=[cfg, INTERPRET_PARAMS, {'ramp_start_state': ramp_start}]),
         Node(package='battery', executable='battery_node', name='battery_node',
              output='screen'),
         Node(package='monitor', executable='monitor_node', name='monitor_node',
@@ -168,7 +193,8 @@ def generate_launch_description():
         # 안쪽/바깥쪽 경계 선택 등)이 들어간다. 같은 노드를 두 인스턴스로 쓰면 그 변경이
         # 트랙 검증이 끝난 흰 차선 주행까지 건드린다. 지금은 같지만 앞으로 갈라진다.
         Node(package='ramp_detection', executable='ramp_node',
-             name='ramp_detection_node', output='screen', parameters=[cfg],
+             name='ramp_detection_node', output='screen',
+             parameters=[cfg, RAMP_PARAMS],
              condition=IfCondition(ramp)),
 
         # --- Object detection (only with yolo:=true) ---
