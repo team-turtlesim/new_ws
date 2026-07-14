@@ -77,9 +77,9 @@ INTERPRET_PARAMS = {
     # 07-08: 속도↑ 시 곡선 언더스티어(못 돎/이탈) -> 곡선 반응을 더 일찍(lo/hi↓) +
     # 조향여유↑(steer_limit 0.7->0.8) 로 튜닝. (라이브 실측으로 추가 조정 여지 있음)
     'kp_offset_curve': 0.5,   # 0.45 -> 0.5 곡선 조향 강화(랩타임 위해 감속 대신 조향으로)
-    'sched_offset_lo': 0.08,  # 0.15 -> 0.08 곡선 반응 매우 일찍(S자, 0.10서 뱀주행無 확인)
+    'sched_offset_lo': 0.06,  # 0.15 -> 0.06 곡선 반응 매우 일찍(S자, 실주행 튜닝 최적)
     'sched_offset_hi': 0.25,  # 0.30 -> 0.25 곡선 게인 더 빨리 최대(S자 조기반응, 2026-07-14)
-    'steer_limit': 0.8,       # 0.7 -> 0.8 곡선 조향 범위 확대
+    'steer_limit': 1.0,       # 0.9 -> 1.0 조향 최대범위(실주행 튜닝 최적, 급S자 대응)
     # 곡선 감속("코너 브레이크"): w↑ 에서 throttle 을 이 비율로 낮춰 라인 유지.
     'curve_throttle_scale': 0.95,  # 0.85 -> 0.95 링 곡선 감속 완화(속도 유지, 사용자 지정)
     # cruise_throttle / require_green_start / ramp_enabled 는 런치 인자(throttle,
@@ -256,7 +256,8 @@ def generate_launch_description():
         Node(package='opencv', executable='opencv_node', name='opencv_node',
              output='screen'),
         Node(package='lane_detection', executable='lane_node',
-             name='lane_detection_node', output='screen', parameters=[cfg]),
+             name='lane_detection_node', output='screen',
+             parameters=[cfg, {'lr_track_enabled': True}]),  # 좌/우 신원 트래킹 기본 ON(실주행 검증됨)
         # interpret: LaneDetection(인지) -> 시간필터/판단 + offset PID(제어결정)
         #            -> LaneInfo(디버그) + Control(/control). 이벤트구동.
         Node(package='interpret', executable='interpret_node',
