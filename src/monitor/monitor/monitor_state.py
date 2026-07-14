@@ -24,6 +24,7 @@ class MonitorState:
             'yolo': None,
             'aruco': None,
             'ramp': None,
+            'bluesign': None,
         }
         self._debug_widths = {
             'grayscale': image_source_width,
@@ -32,6 +33,7 @@ class MonitorState:
             'yolo': image_source_width,
             'aruco': image_source_width,
             'ramp': image_source_width,
+            'bluesign': image_source_width,
         }
         self._debug_heights = {
             'grayscale': image_source_height,
@@ -40,6 +42,7 @@ class MonitorState:
             'yolo': image_source_height,
             'aruco': image_source_height,
             'ramp': image_source_height,
+            'bluesign': image_source_height,
         }
         self._debug_updated_at = {
             'grayscale': None,
@@ -48,6 +51,7 @@ class MonitorState:
             'yolo': None,
             'aruco': None,
             'ramp': None,
+            'bluesign': None,
         }
         self._debug_updated_monotonic = {
             'grayscale': None,
@@ -56,6 +60,7 @@ class MonitorState:
             'yolo': None,
             'aruco': None,
             'ramp': None,
+            'bluesign': None,
         }
 
         self._throttle = None

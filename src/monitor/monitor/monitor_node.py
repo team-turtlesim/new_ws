@@ -66,6 +66,8 @@ class MonitorNode(Node):
         self.declare_parameter('aruco_debug', False)  # ArUco 오버레이 패널 표시 여부
         self.declare_parameter('ramp_debug_topic', '/ramp_detection/image/debug')
         self.declare_parameter('ramp_debug', False)  # 진입로(노란 램프) 오버레이 패널 표시 여부
+        self.declare_parameter('bluesign_debug_topic', '/bluesign/image/debug')
+        self.declare_parameter('bluesign_debug', False)  # 파란 표지판 트리거 오버레이 패널 표시 여부
         self.declare_parameter('control_topic', '/control')
         self.declare_parameter('storage_path', '/')
         self.declare_parameter('storage_poll_interval_sec', 1.0)
@@ -99,6 +101,8 @@ class MonitorNode(Node):
         self.aruco_debug = bool(self.get_parameter('aruco_debug').value)
         self.ramp_debug_topic = self.get_yaml_or_param_str(yaml_config, 'RAMP_DEBUG_TOPIC', 'ramp_debug_topic')
         self.ramp_debug = bool(self.get_parameter('ramp_debug').value)
+        self.bluesign_debug_topic = self.get_yaml_or_param_str(yaml_config, 'BLUESIGN_DEBUG_TOPIC', 'bluesign_debug_topic')
+        self.bluesign_debug = bool(self.get_parameter('bluesign_debug').value)
         if not self.control_topic:
             # Backward compatibility for legacy typo key.
             self.control_topic = str(yaml_config.get('CONTORL_TOPIC', '')).strip()
@@ -171,6 +175,8 @@ class MonitorNode(Node):
             aruco_debug_topic=self.aruco_debug_topic,
             ramp_debug=self.ramp_debug,
             ramp_debug_topic=self.ramp_debug_topic,
+            bluesign_debug=self.bluesign_debug,
+            bluesign_debug_topic=self.bluesign_debug_topic,
             graph_snapshot_provider=self.get_graph_snapshot,
         )
         self.server_thread = FlaskServerThread(self.app, self.web_host, self.web_port)
@@ -225,6 +231,13 @@ class MonitorNode(Node):
                     CompressedImage,
                     self.ramp_debug_topic,
                     self.debug_ramp_callback,
+                    10,
+                )
+            if self.bluesign_debug:
+                self.create_subscription(
+                    CompressedImage,
+                    self.bluesign_debug_topic,
+                    self.debug_bluesign_callback,
                     10,
                 )
         self.create_subscription(
@@ -356,6 +369,9 @@ class MonitorNode(Node):
 
     def debug_ramp_callback(self, msg):
         self._debug_image_callback(msg, 'ramp', self.ramp_debug_topic)
+
+    def debug_bluesign_callback(self, msg):
+        self._debug_image_callback(msg, 'bluesign', self.bluesign_debug_topic)
 
     def storage_timer_callback(self):
         try:

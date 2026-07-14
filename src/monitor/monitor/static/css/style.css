@@ -278,10 +278,16 @@ code {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+/* Edge + Ramp + YOLO + ArUco + BlueSign 다섯 패널: 5열로 표시 */
+.debug-grid--quint {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
 .debug-panel--edge .debug-panel__frame,
 .debug-panel--yolo .debug-panel__frame,
 .debug-panel--aruco .debug-panel__frame,
-.debug-panel--ramp .debug-panel__frame {
+.debug-panel--ramp .debug-panel__frame,
+.debug-panel--bluesign .debug-panel__frame {
   max-height: 60vh;
   object-fit: contain;
   margin: 0 auto;

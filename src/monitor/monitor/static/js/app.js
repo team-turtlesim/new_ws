@@ -28,6 +28,7 @@ const config = window.MONITOR_CONFIG || {
   debugFrameYoloEndpoint: '/api/frame/yolo',
   debugFrameArucoEndpoint: '/api/frame/aruco',
   debugFrameRampEndpoint: '/api/frame/ramp',
+  debugFrameBluesignEndpoint: '/api/frame/bluesign',
   debugImageEnabled: false,
   placeholderUrl: '/api/frame/placeholder',
   refreshIntervalMs: 1000,
@@ -51,6 +52,7 @@ const elements = {
   debugFrameYolo: document.getElementById('debug-frame-yolo'),
   debugFrameAruco: document.getElementById('debug-frame-aruco'),
   debugFrameRamp: document.getElementById('debug-frame-ramp'),
+  debugFrameBluesign: document.getElementById('debug-frame-bluesign'),
   recordBadge: document.getElementById('record-badge'),
   recordBadgeLabel: document.getElementById('record-badge-label'),
   controlCard: document.getElementById('control-card'),
@@ -563,6 +565,7 @@ function refreshDebugFrames() {
   refreshImageByEndpoint(elements.debugFrameYolo, config.debugFrameYoloEndpoint);
   refreshImageByEndpoint(elements.debugFrameAruco, config.debugFrameArucoEndpoint);
   refreshImageByEndpoint(elements.debugFrameRamp, config.debugFrameRampEndpoint);
+  refreshImageByEndpoint(elements.debugFrameBluesign, config.debugFrameBluesignEndpoint);
   debugImageRequestInFlight = false;
 }
 

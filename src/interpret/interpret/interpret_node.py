@@ -182,7 +182,7 @@ class Judgment:
                         '출발 게이트 해제: 초록불 확정(conf=%.2f, %d프레임 연속)'
                         % (green_conf, self._green_run))
                     if bool(gp('yolo_power_gate').value):
-                        self.node.set_yolo_active(False)   # 출발과 동시에 YOLO off
+                        self.node.set_yolo_active(False, '초록불 출발')   # 출발과 동시에 YOLO off
             else:
                 self._green_run = 0   # 초록 끊기면 카운터 리셋(연속 요구)
 
@@ -202,9 +202,11 @@ class Judgment:
                 if d.label == left_label:
                     self.sign_dir = 1
                     self.last_sign_near_time = self.node.get_clock().now()
+                    self.node.note_sign_latch()   # 표지판 인식 -> YOLO 자동 off 카운트다운 시작
                 elif d.label == right_label:
                     self.sign_dir = -1
                     self.last_sign_near_time = self.node.get_clock().now()
+                    self.node.note_sign_latch()
 
     def on_aruco(self, msg):
         """aruco_node 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신."""
@@ -663,6 +665,15 @@ class InterpretNode(Node):
         self.declare_parameter('yolo_active_topic', '/yolo/active')
         self.declare_parameter('marker_id_topic', '/detected_marker_id')
         self.declare_parameter('yolo_wake_marker_id', -1)  # -1=아무 마커나 재가동, ≥0=해당 ID만
+        # 파란 표지판 트리거(/sign/near, bluesign_node 발행)로도 YOLO 를 깨운다.
+        # ArUco 마커 대신(또는 함께) 파란 표지판 색이 보이면 갈림길 근처로 보고 켠다.
+        # ArUco 마커와 동일하게 yolo_power_gate 아래에서만 작동한다.
+        self.declare_parameter('sign_near_topic', '/sign/near')
+        # 표지판 인식 후 YOLO 자동 off 지연(초). 방향표지가 처음 래치(near-gate 통과)된
+        # 시각부터 이 시간 뒤 YOLO 를 1회 끈다(CPU 회수). 방향은 이미 sign_dir 로 래치돼
+        # 있어 조향엔 영향 없다. 빨간도로 ArUco 재가동과 충돌하지 않음(거긴 방향표지 없어
+        # 래치가 안 생김). 라이브: ros2 param set /interpret_node sign_yolo_off_delay 5.0
+        self.declare_parameter('sign_yolo_off_delay', 5.0)
 
         # --- ArUco 마커 연동(정지) -----------------------------------------
         # aruco_node 의 /aruco_stop(Bool, 이미 디바운스됨)을 구독해 True 면 정지시킨다.
@@ -730,6 +741,11 @@ class InterpretNode(Node):
         self.yolo_active_pub = self.create_publisher(
             Bool, str(self.get_parameter('yolo_active_topic').value), gate_qos)
         self._yolo_active_cmd = True   # 현재 YOLO 전원 명령 상태(중복 발행 방지)
+        # 표지판 인식 후 자동 off(transition 7). YOLO 가 켜질 때 '무장'되고, 방향표지가
+        # 처음 래치되면 카운트다운을 시작해 sign_yolo_off_delay 뒤 1회 off. 시작 시엔
+        # 무장 안 함(출발 phase 는 초록불→off 가 관장) -> False 로 시작.
+        self._sign_off_armed = False
+        self._sign_latch_time = None   # 방향표지 최초 래치 시각(카운트다운 기준). None=미시작
 
         # YOLO 검출 구독(정지/감속 게이팅용). 항상 구독하되 gate 는 yolo_enabled 로 제어.
         self.yolo_sub = self.create_subscription(
@@ -752,6 +768,14 @@ class InterpretNode(Node):
             Int32,
             str(self.get_parameter('marker_id_topic').value),
             self.marker_callback,
+            10,
+        )
+
+        # 파란 표지판 근접 트리거 구독(/sign/near, bluesign_node). True 면 YOLO 전원을 켠다.
+        self.sign_near_sub = self.create_subscription(
+            Bool,
+            str(self.get_parameter('sign_near_topic').value),
+            self.sign_near_callback,
             10,
         )
 
@@ -833,6 +857,9 @@ class InterpretNode(Node):
             offset, confidence, stop, slow, bias, thr_scale, heading)
         self.publish_control(steering, throttle)
 
+        # 표지판 인식 후 YOLO 자동 off(transition 7): 래치 후 지연 지나면 1회 off.
+        self.check_sign_yolo_off()
+
         if bool(self.get_parameter('debug_log').value):
             hd = f' hdg={heading:+.3f}' if use_ramp else ''
             self.get_logger().info(
@@ -869,19 +896,52 @@ class InterpretNode(Node):
         wake = int(self.get_parameter('yolo_wake_marker_id').value)
         if wake >= 0 and int(msg.data) != wake:
             return
-        self.set_yolo_active(True)
+        self.set_yolo_active(True, 'ArUco 마커')
 
-    def set_yolo_active(self, on):
-        """YOLO 전원 게이트 명령(/yolo/active). 상태가 바뀔 때만 발행(중복 방지)."""
+    def sign_near_callback(self, msg: Bool):
+        """파란 표지판 근접(/sign/near=True) -> YOLO 전원 재가동. ArUco 마커 트리거와 동일하게
+        yolo_power_gate 아래에서만 작동한다. 켜기만 하고, 끄는 것은 표지판 인식 후 자동 off
+        (check_sign_yolo_off)와 초록불 출발이 관장한다."""
+        if not bool(self.get_parameter('yolo_power_gate').value):
+            return
+        if bool(msg.data):
+            self.set_yolo_active(True, '파란 표지판')
+
+    def note_sign_latch(self):
+        """방향표지가 near-gate 를 통과해 처음 래치되면 YOLO 자동 off 카운트다운을 시작한다.
+        YOLO 가 켜져 무장(_sign_off_armed)돼 있을 때만, 아직 카운트다운 전일 때만 1회."""
+        if self._sign_off_armed and self._sign_latch_time is None:
+            self._sign_latch_time = self.get_clock().now()
+
+    def check_sign_yolo_off(self):
+        """표지판 래치 후 sign_yolo_off_delay 초가 지나면 YOLO 를 1회 끈다(transition 7).
+        매 프레임 호출. set_yolo_active(False) 가 무장 해제 + 카운트다운 리셋을 겸한다."""
+        if not bool(self.get_parameter('yolo_power_gate').value):
+            return
+        if not self._sign_off_armed or self._sign_latch_time is None:
+            return
+        delay = float(self.get_parameter('sign_yolo_off_delay').value)
+        age = (self.get_clock().now() - self._sign_latch_time).nanoseconds * 1e-9
+        if age >= delay:
+            self.set_yolo_active(False, '표지판 인식 후')
+
+    def set_yolo_active(self, on, reason=''):
+        """YOLO 전원 게이트 명령(/yolo/active). 상태가 바뀔 때만 발행(중복 방지).
+        켜질 때 표지판 자동 off 를 무장하고, 꺼질 때 해제한다(카운트다운 리셋)."""
         on = bool(on)
         if on == self._yolo_active_cmd:
             return
         self._yolo_active_cmd = on
+        # 표지판 자동 off 무장/해제: ON 이면 무장(이후 표지판 래치가 카운트다운 시작),
+        # OFF 면 해제. ArUco 재가동도 무장하지만 빨간도로엔 방향표지가 없어 래치가 안 생겨
+        # 자동 off 가 걸리지 않는다(아루코 wake 와 충돌 없음).
+        self._sign_off_armed = on
+        self._sign_latch_time = None
         m = Bool()
         m.data = on
         self.yolo_active_pub.publish(m)
         self.get_logger().info(
-            'YOLO 전원 -> %s' % ('ON (ArUco 마커)' if on else 'OFF (초록불 출발)'))
+            'YOLO 전원 -> %s%s' % ('ON' if on else 'OFF', ' (%s)' % reason if reason else ''))
 
     # ------------------------------------------------------------------ config
     def load_steer_trim(self):

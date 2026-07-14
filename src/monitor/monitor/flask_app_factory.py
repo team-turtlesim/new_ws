@@ -45,6 +45,8 @@ def create_app( state, page_title,
                 aruco_debug_topic='/aruco/image/debug',
                 ramp_debug=False,
                 ramp_debug_topic='/ramp_detection/image/debug',
+                bluesign_debug=False,
+                bluesign_debug_topic='/bluesign/image/debug',
                 graph_snapshot_provider=None ):
     
     app = Flask( __name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR),)
@@ -75,6 +77,8 @@ def create_app( state, page_title,
             aruco_debug_topic=aruco_debug_topic,
             ramp_debug=ramp_debug,
             ramp_debug_topic=ramp_debug_topic,
+            bluesign_debug=bluesign_debug,
+            bluesign_debug_topic=bluesign_debug_topic,
         )
 
     @app.get('/api/status')
@@ -195,6 +199,22 @@ def create_app( state, page_title,
             return Response(
                 build_camera_placeholder_svg(
                     image_display_width, image_display_height, aruco_debug_topic
+                ),
+                mimetype='image/svg+xml',
+            )
+
+        response = Response(frame_bytes, mimetype='image/jpeg')
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        return response
+
+    @app.get('/api/frame/bluesign')
+    def api_frame_bluesign():
+        frame_bytes = state.get_debug_frame('bluesign')
+        if frame_bytes is None:
+            return Response(
+                build_camera_placeholder_svg(
+                    image_display_width, image_display_height, bluesign_debug_topic
                 ),
                 mimetype='image/svg+xml',
             )

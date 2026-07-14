@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bluesign</name>
+  <version>0.0.0</version>
+  <description>Blue-sign trigger node: subscribes the opencv blue mask (/opencv/image/blue),
+    counts blue pixels in an upper ROI, debounces, and publishes /sign/near (Bool) to wake YOLO.
+    Cheap classical-CV cascade gate so YOLO stays off during the S-curve and only powers on
+    when the (blue) direction sign comes into view near the fork.</description>
+  <maintainer email="sooyong.park@telechips.com">topst</maintainer>
+  <license>TODO: License declaration</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- cv_bridge 는 쓰지 않음 (new_ws 관례대로 np.frombuffer + cv2.imdecode 로 압축영상 디코드). -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

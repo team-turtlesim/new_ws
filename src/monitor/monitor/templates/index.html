@@ -60,8 +60,8 @@
           </dl>
 
           {% if debug_image %}
-          {% set extra = (1 if yolo_debug else 0) + (1 if aruco_debug else 0) + (1 if ramp_debug else 0) %}
-          <div class="debug-grid {{ 'debug-grid--single' if extra == 0 else 'debug-grid--double' if extra == 1 else 'debug-grid--triple' if extra == 2 else 'debug-grid--quad' }}" id="debug-grid">
+          {% set extra = (1 if yolo_debug else 0) + (1 if aruco_debug else 0) + (1 if ramp_debug else 0) + (1 if bluesign_debug else 0) %}
+          <div class="debug-grid {{ 'debug-grid--single' if extra == 0 else 'debug-grid--double' if extra == 1 else 'debug-grid--triple' if extra == 2 else 'debug-grid--quad' if extra == 3 else 'debug-grid--quint' }}" id="debug-grid">
             <article class="debug-panel debug-panel--edge">
               <p class="debug-panel__title">Edge</p>
               <img id="debug-frame-edge" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Edge preview">
@@ -86,6 +86,13 @@
               <p class="debug-panel__title">ArUco</p>
               <img id="debug-frame-aruco" class="debug-panel__frame" src="{{ placeholder_url }}" alt="ArUco detection preview">
               <p class="debug-panel__topic">{{ aruco_debug_topic }}</p>
+            </article>
+            {% endif %}
+            {% if bluesign_debug %}
+            <article class="debug-panel debug-panel--bluesign">
+              <p class="debug-panel__title">BlueSign</p>
+              <img id="debug-frame-bluesign" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Blue sign trigger preview">
+              <p class="debug-panel__topic">{{ bluesign_debug_topic }}</p>
             </article>
             {% endif %}
           </div>
@@ -230,10 +237,12 @@
         debugFrameYoloEndpoint: {{ url_for('api_frame_yolo')|tojson }},
         debugFrameArucoEndpoint: {{ url_for('api_frame_aruco')|tojson }},
         debugFrameRampEndpoint: {{ url_for('api_frame_ramp')|tojson }},
+        debugFrameBluesignEndpoint: {{ url_for('api_frame_bluesign')|tojson }},
         debugImageEnabled: {{ debug_image|tojson }},
         yoloDebugEnabled: {{ yolo_debug|tojson }},
         arucoDebugEnabled: {{ aruco_debug|tojson }},
         rampDebugEnabled: {{ ramp_debug|tojson }},
+        bluesignDebugEnabled: {{ bluesign_debug|tojson }},
         placeholderUrl: {{ placeholder_url|tojson }},
         refreshIntervalMs: {{ refresh_interval_ms|tojson }},
         imageRefreshIntervalMs: {{ image_refresh_interval_ms|tojson }}

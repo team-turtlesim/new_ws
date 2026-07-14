@@ -52,6 +52,13 @@ class OpenCvNode(Node):
         self.declare_parameter('yellow_h_max', 38)
         self.declare_parameter('yellow_s_min', 80)
         self.declare_parameter('yellow_v_min', 80)
+        # 파란색(HSV): 파란 표지판 트리거용. OpenCV 는 H 가 0~179 라 파랑은 100~130 부근.
+        # bluesign_node 가 /opencv/image/blue 를 구독해 상단 ROI 파란 픽셀로 YOLO 를 깨운다.
+        # (트랙에 파랑은 표지판뿐이라 오검출 위험이 낮다.) 조명 어두우면 blue_v_min 을 낮춘다.
+        self.declare_parameter('blue_h_min', 100)
+        self.declare_parameter('blue_h_max', 130)
+        self.declare_parameter('blue_s_min', 80)
+        self.declare_parameter('blue_v_min', 60)
         # /edge 에 실을 색. 'white'(기본) | 'both'(흰|노랑 OR, 예전 동작).
         # lane_detection 은 색을 구분하지 않으므로, 노란색이 섞이면 램프 선을 차선으로
         # 오인한다(2026-07-10 실측: 램프 앞 ROI 입력의 39%가 노란 픽셀이었다).
@@ -60,6 +67,10 @@ class OpenCvNode(Node):
         # /opencv/image/edge 는 예전 그대로 흰|노랑 OR 이라 기존 차선주행은 무영향.
         # detect_mode='edge'(Canny) 면 색 정보가 없어 발행하지 않는다.
         self.declare_parameter('publish_yellow', True)
+        # 파란색 전용 마스크를 /opencv/image/blue 로 발행(bluesign_node 가 구독해 파란
+        # 표지판 근접 트리거로 YOLO 를 깨운다). yellow 와 동일하게 color 모드에서만 존재하고,
+        # 흰 차선 주행(/edge)에는 전혀 영향을 주지 않는다.
+        self.declare_parameter('publish_blue', True)
         # 입력 채널 순서 보정. imdecode 결과를 BGR 로 가정하고 cvtColor(BGR2HSV) 한다.
         # 실제 C920 은 bgr8 이라 False. rgb8 소스(시뮬 등)면 True 로 켜야 노란색이 잡힌다.
         self.declare_parameter('swap_rb', False)
@@ -72,6 +83,7 @@ class OpenCvNode(Node):
         self.debug_log = bool(self.get_parameter('debug_log').value)
         self.publish_debug_streams = bool(self.get_parameter('publish_debug_streams').value)
         self.publish_yellow = bool(self.get_parameter('publish_yellow').value)
+        self.publish_blue = bool(self.get_parameter('publish_blue').value)
 
         if not 0 <= self.jpeg_quality <= 100:
             raise ValueError('jpeg_quality must be in range [0, 100]')
@@ -109,6 +121,12 @@ class OpenCvNode(Node):
             self.yellow_pub = self.create_publisher(
                 CompressedImage, '/opencv/image/yellow', image_qos,
             )
+        # 파란색 전용 마스크(bluesign_node 용) -> 켜졌을 때만 퍼블리셔 생성.
+        self.blue_pub = None
+        if self.publish_blue:
+            self.blue_pub = self.create_publisher(
+                CompressedImage, '/opencv/image/blue', image_qos,
+            )
         # gray/blur 는 디버그용 -> 켜졌을 때만 퍼블리셔 생성.
         self.gray_pub = None
         self.blur_pub = None
@@ -144,7 +162,7 @@ class OpenCvNode(Node):
         return width, height
 
     def color_lane_mask(self, bgr):
-        """(/edge 용 차선 마스크, 노란색 전용 마스크)를 돌려준다.
+        """(/edge 용 차선 마스크, 노란색 전용 마스크, 파란색 전용 마스크)를 돌려준다.
 
         Canny 는 모든 경계(그림자·트랙끝·다른 차)를 다 잡아 노이즈가 많지만,
         색 임계값은 차선 색만 골라내 더 안정적일 수 있다(대신 조명 변화에 민감).
@@ -177,13 +195,23 @@ class OpenCvNode(Node):
             ], dtype=np.uint8),
             np.array([int(gp('yellow_h_max').value), 255, 255], dtype=np.uint8),
         )
+        # 파란색: 파란 표지판 트리거용. 같은 hsv 를 재사용하므로 추가 디코드/색변환이 없다.
+        blue = cv2.inRange(
+            hsv,
+            np.array([
+                int(gp('blue_h_min').value),
+                int(gp('blue_s_min').value),
+                int(gp('blue_v_min').value),
+            ], dtype=np.uint8),
+            np.array([int(gp('blue_h_max').value), 255, 255], dtype=np.uint8),
+        )
         edge_color = str(gp('edge_color').value)
         mask = white if edge_color == 'white' else cv2.bitwise_or(white, yellow)
         # 점잡음 제거
         mask = cv2.medianBlur(mask, 5)
-        # 노란색 전용 마스크도 같은 잡음제거를 거쳐 함께 돌려준다(원본 유지, 닫힘 없음 —
+        # 노란색/파란색 전용 마스크도 같은 잡음제거를 거쳐 함께 돌려준다(원본 유지, 닫힘 없음 —
         # 점선 잇기는 소비자인 ramp_detection 이 필요할 때만 국소 적용한다).
-        return mask, cv2.medianBlur(yellow, 5)
+        return mask, cv2.medianBlur(yellow, 5), cv2.medianBlur(blue, 5)
 
     def to_compressed_msg(self, image, source_msg: CompressedImage, frame_id: str):
         ok, encoded = cv2.imencode(
@@ -233,8 +261,9 @@ class OpenCvNode(Node):
         # 어느 쪽이든 lane_detection 은 동일하게 /opencv/image/edge 를 구독해 처리한다.
         mode = str(self.get_parameter('detect_mode').value)
         yellow_mask = None
+        blue_mask = None
         if mode == 'color':
-            edge, yellow_mask = self.color_lane_mask(np_arr)
+            edge, yellow_mask, blue_mask = self.color_lane_mask(np_arr)
         else:
             edge = cv2.Canny(blur, 50, 150)
 
@@ -248,6 +277,12 @@ class OpenCvNode(Node):
             yellow_msg = self.to_compressed_msg(yellow_mask, msg, frame_id='opencv_yellow')
             if yellow_msg is not None:
                 self.yellow_pub.publish(yellow_msg)
+
+        # 파란색 전용 마스크 발행(color 모드에서만 존재). bluesign_node 가 구독.
+        if self.blue_pub is not None and blue_mask is not None:
+            blue_msg = self.to_compressed_msg(blue_mask, msg, frame_id='opencv_blue')
+            if blue_msg is not None:
+                self.blue_pub.publish(blue_msg)
 
         # gray/blur 는 디버그용 -> 켜졌을 때만 인코딩/발행(평소 CPU 절약).
         if self.publish_debug_streams:

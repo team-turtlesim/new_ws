@@ -1,3 +1,5 @@
+import ctypes
+import fcntl
 import os
 from pathlib import Path
 
@@ -32,6 +34,21 @@ class CameraNode(Node):
         self.declare_parameter('mipi_camera_device', '/dev/video0')
         self.declare_parameter('flip_method', 'rotate-180')
         self.declare_parameter('jpeg_quality', 90)
+        # 노출/게인 고정 (저조도 fps 방어 + 검출 일관성, USB 카메라 전용).
+        # USB 웹캠 오토 익스포저는 어두우면 노출시간을 늘려 프레임레이트를 반토막 낸다
+        # (2026-07-14 대회장 실측: 30->15fps. 원인=UVC "Exposure, Auto Priority"=1).
+        # 수동 노출로 고정하면 빛이 부족해도 fps 유지 + 조명 변화에 검출이 일관됨.
+        # 적용은 캡처 오픈 뒤 apply_v4l2_controls() 에서 ioctl 로 직접 세팅한다(가장 확실 —
+        # GStreamer extra-controls 로는 exposure_absolute 가 156 으로 리셋돼 안 먹혔음).
+        #   exposure_absolute: 노출시간(단위 100us). fps 상한=1/(exp*100us), 30fps→<=333.
+        #     (실측: 이 C920e 는 스트리밍 중 156 근처로 되돌아가는 경향 → 밝기는 주로 gain.)
+        #   camera_gain: 0~255, 신호 증폭(밝기↑, 노이즈↑, fps 무관). 밝기 조절의 주 레버.
+        # 2026-07-14 대회장 확정: exposure 156 + gain 20 (30fps 유지 + 어두운 구간 라인 확보).
+        # (조명 따라 gain 재조정 필요할 수 있음 — python3 ~/cam.py 156 <gain> 로 라이브 튜닝.
+        #  밝은 곳은 10으로도 잘 잡히나 어두운 구간에서 라인 놓쳐 20으로 상향.)
+        # <=0 이면 수동제어 미적용(오토 익스포저=기존 동작). launch 인자 exposure/gain 로 튜닝.
+        self.declare_parameter('exposure_absolute', 156)
+        self.declare_parameter('camera_gain', 20)
         self.declare_parameter('debug_log', True)
 
         self.vehicle_config_file = os.path.expanduser(
@@ -53,6 +70,8 @@ class CameraNode(Node):
         # GStreamer caps 의 framerate 는 정수 fps 여야 하므로 publish_hz 를 반올림해 사용.
         self.capture_fps = max(1, int(round(publish_hz)))
         self.jpeg_quality = jpeg_quality
+        self.exposure_absolute = int(self.get_parameter('exposure_absolute').value)
+        self.camera_gain = int(self.get_parameter('camera_gain').value)
 
         self.image_width, self.image_height = self.load_image_size()
         self.usb_cam_enabled, self.mipi_cam_enabled = self.load_camera_source_flags()
@@ -87,12 +106,18 @@ class CameraNode(Node):
                 f'width={self.image_width}, height={self.image_height})'
             )
 
+        # 캡처 오픈 직후 노출/게인을 수동 고정(ioctl). USB + exposure_absolute>0 일 때만.
+        self.apply_v4l2_controls()
+
         self.timer = self.create_timer(1.0 / self.publish_hz, self.timer_callback)
         self.get_logger().info('\n'
             f'[Camera Node] : topic={publish_topic} \n'
             f'[camera source] : {self.camera_source} \n'
             f'[width] : {self.image_width}, [height] : {self.image_height} \n'
             f'[capture_fps] : {self.capture_fps} \n'
+            f'[exposure/gain] : '
+            f'{self.exposure_absolute if self.exposure_absolute > 0 else "auto"}'
+            f'/{self.camera_gain} \n'
             f'[camera_device] : {camera_device} \n'
             f'[flip_method] : {flip_method} \n'
             f'[jpeg_quality] : {self.jpeg_quality} \n'
@@ -147,6 +172,8 @@ class CameraNode(Node):
 
     def build_candidate_pipelines(self, camera_device, flip_method):
         if self.usb_cam_enabled:
+            # 노출/게인은 파이프라인이 아니라 apply_v4l2_controls() 에서 ioctl 로 세팅한다
+            # (GStreamer extra-controls 로는 exposure_absolute 가 156 으로 리셋돼 안 먹혔음).
             # Many USB webcams expose MJPG by default.
             mjpg_pipeline = (
                 f"v4l2src device={camera_device} io-mode=2 ! "
@@ -191,6 +218,43 @@ class CameraNode(Node):
         self.cap = None
         self.pipeline = None
         return False
+
+    def apply_v4l2_controls(self):
+        """캡처 오픈 뒤 노출/게인을 ioctl 로 직접 세팅(USB 카메라 전용).
+        GStreamer extra-controls 로는 exposure_absolute 가 스트리밍 중 156 으로 리셋돼
+        안 먹혔다(2026-07-14 실측). ioctl 로 exposure_auto=1(Manual)->exposure_absolute->
+        gain 순서로 세팅하면 확실히 적용된다. 실패해도 캡처는 계속(경고만)."""
+        if not self.usb_cam_enabled or self.exposure_absolute <= 0:
+            return
+        vidioc_s_ctrl = 0xc008561c
+        ids = {'exposure_auto': 0x009a0901,        # 1 = Manual Mode
+               'exposure_absolute': 0x009a0902,
+               'gain': 0x00980913}
+
+        class _Ctrl(ctypes.Structure):
+            _fields_ = [('id', ctypes.c_uint32), ('value', ctypes.c_int32)]
+
+        try:
+            fd = os.open(self.camera_device, os.O_RDWR)
+        except OSError as exc:
+            self.get_logger().warning(f'노출/게인 세팅용 장치 열기 실패: {exc}')
+            return
+        try:
+            for name, val in (('exposure_auto', 1),
+                              ('exposure_absolute', self.exposure_absolute),
+                              ('gain', self.camera_gain)):
+                c = _Ctrl()
+                c.id = ids[name]
+                c.value = int(val)
+                try:
+                    fcntl.ioctl(fd, vidioc_s_ctrl, c)
+                except OSError as exc:
+                    self.get_logger().warning(f'{name}={val} 세팅 실패: {exc}')
+            self.get_logger().info(
+                f'카메라 수동 노출 적용(ioctl): exposure_absolute={self.exposure_absolute} '
+                f'gain={self.camera_gain} (Manual Mode)')
+        finally:
+            os.close(fd)
 
     def load_camera_device_overrides(self, default_usb_camera_device, default_mipi_camera_device):
         if not os.path.exists(self.vehicle_config_file):
