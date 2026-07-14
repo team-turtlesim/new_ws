@@ -76,9 +76,9 @@ INTERPRET_PARAMS = {
     # 게인 스케줄링(직진<->곡선, |offset| 기준). 곡선에서 offset 이 벌어지면 kp↑.
     # 07-08: 속도↑ 시 곡선 언더스티어(못 돎/이탈) -> 곡선 반응을 더 일찍(lo/hi↓) +
     # 조향여유↑(steer_limit 0.7->0.8) 로 튜닝. (라이브 실측으로 추가 조정 여지 있음)
-    'kp_offset_curve': 0.45,  # 곡선 kp(offset 교정 강화)
-    'sched_offset_lo': 0.15,  # 0.3 -> 0.15 곡선 반응 더 일찍 시작(언더스티어 대응)
-    'sched_offset_hi': 0.30,  # 0.6 -> 0.30 곡선 게인 더 빨리 최대
+    'kp_offset_curve': 0.5,   # 0.45 -> 0.5 곡선 조향 강화(랩타임 위해 감속 대신 조향으로)
+    'sched_offset_lo': 0.08,  # 0.15 -> 0.08 곡선 반응 매우 일찍(S자, 0.10서 뱀주행無 확인)
+    'sched_offset_hi': 0.25,  # 0.30 -> 0.25 곡선 게인 더 빨리 최대(S자 조기반응, 2026-07-14)
     'steer_limit': 0.8,       # 0.7 -> 0.8 곡선 조향 범위 확대
     # 곡선 감속("코너 브레이크"): w↑ 에서 throttle 을 이 비율로 낮춰 라인 유지.
     'curve_throttle_scale': 0.95,  # 0.85 -> 0.95 링 곡선 감속 완화(속도 유지, 사용자 지정)
@@ -144,6 +144,15 @@ def generate_launch_description():
     green_start = LaunchConfiguration('green_start')
     exposure = LaunchConfiguration('exposure')
     gain = LaunchConfiguration('gain')
+    yolo_start = LaunchConfiguration('yolo_start')
+    yolo_arm_signoff = LaunchConfiguration('yolo_arm_signoff')
+
+    # yolo_start:=on|off -> 초기 YOLO 추론(전원) 상태 bool. yolo_node.active 와 interpret 의
+    # 초기 _yolo_active_cmd 를 함께 맞춰(둘이 어긋나면 첫 wake 가 dedup 에 삼켜짐) 특정
+    # 구간부터 그 구간에 맞는 on/off 로 테스트할 수 있게 한다. (축2=추론 on/off, 노드
+    # 존재여부 yolo:= 와 다름.)
+    yolo_active_start = ParameterValue(
+        PythonExpression(["'", yolo_start, "' == 'on'"]), value_type=bool)
 
     # monitor "edge" pane topic: lane overlay when debug_overlay, else raw edge.
     edge_topic = PythonExpression([
@@ -220,6 +229,22 @@ def generate_launch_description():
                         '근처에서 YOLO 전원(/yolo/active)을 켠다(ArUco 마커 대신 색 트리거). '
                         'yolo_power_gate=true(기본)일 때만 실제로 YOLO 를 깨운다.',
         ),
+        DeclareLaunchArgument(
+            'yolo_start', default_value='on',
+            description='초기 YOLO 추론(전원) 상태 on|off. 축2(떠 있는 노드가 추론을 돌리냐)'
+                        '이지 노드 존재여부(yolo:=)가 아니다 — yolo:=true 여야 의미 있음. '
+                        'on(기본): 켠 채 시작(출발선 신호등을 본다). off: 끈 채 시작 -> 파랑/'
+                        '아루코 wake 때 켜짐(특정 구간부터 테스트: S자→파랑 wake 검증 등). '
+                        'yolo_node.active 와 interpret 초기 상태를 함께 맞춰 첫 wake 가 '
+                        'dedup 에 안 삼켜지게 한다.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_arm_signoff', default_value='false',
+            description='표지판 후 자동 off(transition 7)를 부팅 시 무장할지. 보통 파랑/아루코 '
+                        'wake 때 자동 무장되므로 false(기본). 표지판 구간부터 곧바로'
+                        '(yolo_start:=on) 테스트해 7번(래치 후 sign_yolo_off_delay 뒤 off)을 '
+                        '확인할 때만 true.',
+        ),
 
         # --- Perception + judgment/control-law + web (always) ---
         Node(package='camera', executable='camera_node', name='camera_node',
@@ -244,6 +269,10 @@ def generate_launch_description():
                  'cruise_throttle': ParameterValue(throttle, value_type=float),
                  'require_green_start': ParameterValue(green_start, value_type=bool),
                  'ramp_enabled': ParameterValue(ramp, value_type=bool),
+                 # 초기 YOLO 전원 상태 + 표지판-off 초기무장 (yolo_start / yolo_arm_signoff).
+                 # yolo_node.active 와 반드시 같은 값으로 맞춘다(dedup 어긋남 방지).
+                 'yolo_start_active': yolo_active_start,
+                 'sign_off_armed_start': ParameterValue(yolo_arm_signoff, value_type=bool),
              }]),
         Node(package='battery', executable='battery_node', name='battery_node',
              output='screen'),
@@ -282,7 +311,11 @@ def generate_launch_description():
         # 검출을 /yolo/detections + /yolo/image/debug 로 발행. 모델이 없으면 빈 검출만
         # 내보내며 죽지 않는다(models/README.md 참고).
         Node(package='yolo', executable='yolo_node', name='yolo_node',
-             output='screen', condition=IfCondition(yolo)),
+             output='screen',
+             # active = 초기 추론 on/off (yolo_start). interpret 의 yolo_start_active 와
+             # 같은 값이어야 첫 wake 가 dedup 에 안 삼켜진다.
+             parameters=[{'active': yolo_active_start}],
+             condition=IfCondition(yolo)),
 
         # --- ArUco marker detection (only with aruco:=true) ---
         # 카메라 원본을 직접 구독하는 독립 인지 브랜치. /detected_marker_id + /aruco_stop

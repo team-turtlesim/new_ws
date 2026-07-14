@@ -45,7 +45,8 @@ class CameraNode(Node):
         #   camera_gain: 0~255, 신호 증폭(밝기↑, 노이즈↑, fps 무관). 밝기 조절의 주 레버.
         # 2026-07-14 대회장 확정: exposure 156 + gain 20 (30fps 유지 + 어두운 구간 라인 확보).
         # (조명 따라 gain 재조정 필요할 수 있음 — python3 ~/cam.py 156 <gain> 로 라이브 튜닝.
-        #  밝은 곳은 10으로도 잘 잡히나 어두운 구간에서 라인 놓쳐 20으로 상향.)
+        #  트랙에 밝은/어두운 구간이 섞여 있으면 단일 gain 으로 양쪽 만족 어려움 — 어두운
+        #  구간 기준으로 맞추거나(라인 놓침이 더 위험) 오토익스포저+AutoPriority=0 검토.)
         # <=0 이면 수동제어 미적용(오토 익스포저=기존 동작). launch 인자 exposure/gain 로 튜닝.
         self.declare_parameter('exposure_absolute', 156)
         self.declare_parameter('camera_gain', 20)

@@ -663,6 +663,15 @@ class InterpretNode(Node):
         # 인지 시 on. False 면 이 자동 게이팅을 끈다(YOLO 계속 켜둠 — 링/벤치 테스트).
         self.declare_parameter('yolo_power_gate', True)
         self.declare_parameter('yolo_active_topic', '/yolo/active')
+        # 초기 YOLO 추론(전원) 상태 = 부팅 시 /yolo/active. 런치 yolo_start:=on|off 가
+        # yolo_node.active 와 함께 이 값을 맞춘다(둘이 어긋나면 set_yolo_active 의 dedup 이
+        # 첫 wake 를 삼킴). 특정 구간부터 테스트할 때 그 구간에 맞는 on/off 로 시작한다.
+        # 기본 True(켠 채 시작 = 출발선 신호등을 본다).
+        self.declare_parameter('yolo_start_active', True)
+        # 표지판 후 자동 off(transition 7) 초기 무장 여부. 보통 파랑/아루코 wake 때 무장되지만,
+        # 표지판 구간부터 곧바로(yolo_start:=on) 테스트할 때 true 로 무장해 7번을 확인한다.
+        # 기본 False(출발 phase 를 헛-표지판 off 로부터 보호).
+        self.declare_parameter('sign_off_armed_start', False)
         self.declare_parameter('marker_id_topic', '/detected_marker_id')
         self.declare_parameter('yolo_wake_marker_id', -1)  # -1=아무 마커나 재가동, ≥0=해당 ID만
         # 파란 표지판 트리거(/sign/near, bluesign_node 발행)로도 YOLO 를 깨운다.
@@ -740,11 +749,12 @@ class InterpretNode(Node):
         )
         self.yolo_active_pub = self.create_publisher(
             Bool, str(self.get_parameter('yolo_active_topic').value), gate_qos)
-        self._yolo_active_cmd = True   # 현재 YOLO 전원 명령 상태(중복 발행 방지)
+        # 현재 YOLO 전원 명령 상태(중복 발행 방지). 초기값 = yolo_start_active(런치 yolo_start).
+        self._yolo_active_cmd = bool(self.get_parameter('yolo_start_active').value)
         # 표지판 인식 후 자동 off(transition 7). YOLO 가 켜질 때 '무장'되고, 방향표지가
-        # 처음 래치되면 카운트다운을 시작해 sign_yolo_off_delay 뒤 1회 off. 시작 시엔
-        # 무장 안 함(출발 phase 는 초록불→off 가 관장) -> False 로 시작.
-        self._sign_off_armed = False
+        # 처음 래치되면 카운트다운을 시작해 sign_yolo_off_delay 뒤 1회 off. 초기 무장은
+        # sign_off_armed_start(기본 False — 출발 phase 는 초록불→off 가 관장).
+        self._sign_off_armed = bool(self.get_parameter('sign_off_armed_start').value)
         self._sign_latch_time = None   # 방향표지 최초 래치 시각(카운트다운 기준). None=미시작
 
         # YOLO 검출 구독(정지/감속 게이팅용). 항상 구독하되 gate 는 yolo_enabled 로 제어.

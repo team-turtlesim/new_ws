@@ -94,11 +94,32 @@ class LaneDetectionNode(Node):
         self.declare_parameter('min_lane_sep_ratio', 0.2)
         # track_tol_px: 인접 스캔행 간 같은 차선으로 매칭할 최대 x 이동(px).
         self.declare_parameter('track_tol_px', 40.0)
+        # --- 좌/우 신원 트래킹(단일선 오분류 방지) ---
+        # 단일선일 때 그 선이 좌/우인지 "화면 중심 기준(스테이트리스)"으로만 정하면, 곡선에서
+        # 바깥선이 화면 중심을 넘나들 때 좌↔우 판정이 프레임마다 뒤집혀 offset 부호가 튄다.
+        # 켜면 2선 프레임에서 확정한 좌/우 last_x 를 물려받아(가까운 쪽 매칭) 단일선 신원 유지.
+        # 기본 False → 벤치/저속 검증 후 True(ros2 param set /lane_detection_node lr_track_enabled true).
+        self.declare_parameter('lr_track_enabled', False)
+        # 단일선을 직전 선에 매칭할 때 허용 이동량(px). 이보다 멀면 매칭 불신 → center_x 폴백.
+        self.declare_parameter('lr_track_max_jump_px', 60.0)
+        # 완전미검출이 이 프레임 수 연속되면 트래커 리셋(콜드). ≈0.5s @30fps.
+        self.declare_parameter('lr_track_reset_frames', 15)
+        # 히스테리시스(보강): 단일선이 좌/우 저장값 둘 다에서 max_jump 초과(급커브에서 선이
+        # 빨리 이동)일 때, center_x 폴백(=뒤집힘 재발) 대신 '직전 단일선 라벨 유지'로 뒤집힘
+        # 차단. 2선 프레임/콜드 리셋 시 초기화. lr_track_enabled True 일 때만 의미. (2026-07-14)
+        self.declare_parameter('lr_hysteresis_enabled', True)
 
         # --- 내부 상태 ------------------------------------------------------
         # 차선폭(px)은 기하 상태라 인지에 둔다. 양쪽 검출 시 EMA로 학습해
         # 한쪽만 보일 때 반대편 차선 위치를 추정하는 데 쓴다. (시간 평활 아님)
         self.lane_width_px = None
+        # 좌/우 신원 트래킹 상태(lr_track_enabled): 2선 프레임에서 각 선 마지막 x 저장 →
+        # 단일선으로 줄면 가까운 쪽 라벨 계승.
+        self._last_left_x = None      # 좌차선 마지막 관측 x (median)
+        self._last_right_x = None     # 우차선 마지막 관측 x
+        self._track_miss = 0          # 연속 완전미검출 프레임 수(스테일 판정용)
+        self._last_single_side = None  # 직전 단일선 라벨('left'/'right') — 히스테리시스용
+        self._lr_dbg = ''              # lr 판정 근거 문자열(디버그 로그용)
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -153,6 +174,41 @@ class LaneDetectionNode(Node):
             self.get_logger().warning('Failed to decode edge image')
         return edge
 
+    # ------------------------------------------------------ 좌/우 신원 분류(계승)
+    def _classify_single(self, m, center_x):
+        """단일선을 좌/우로 판정. 우선순위: (1) 저장된 좌/우 x 중 가까운 쪽 계승,
+        (2) 애매하면(둘 다 max_jump 초과) 직전 단일선 라벨 유지(히스테리시스), (3) 그도
+        없으면 center_x 폴백. lr_track_enabled=False 면 기존 center_x 동작 그대로."""
+        if not bool(self.get_parameter('lr_track_enabled').value):
+            self._lr_dbg = ''
+            return 'left' if m < center_x else 'right'          # 기존 동작
+        max_jump = float(self.get_parameter('lr_track_max_jump_px').value)
+        ll, rl = self._last_left_x, self._last_right_x
+        side, why = None, ''
+        # (1) 계승: 저장된 좌/우 위치 중 가까운 쪽 (max_jump 이내)
+        if ll is not None and rl is not None:
+            dl, dr = abs(m - ll), abs(m - rl)
+            if min(dl, dr) <= max_jump:
+                side = 'left' if dl <= dr else 'right'
+                why = 'inherit(dl=%.0f,dr=%.0f)' % (dl, dr)
+        elif ll is not None:
+            if abs(m - ll) <= max_jump:
+                side, why = 'left', 'inheritL(d=%.0f)' % abs(m - ll)
+        elif rl is not None:
+            if abs(m - rl) <= max_jump:
+                side, why = 'right', 'inheritR(d=%.0f)' % abs(m - rl)
+        # (2) 애매 → 히스테리시스(직전 단일선 라벨 유지) → (3) 없으면 center_x
+        if side is None:
+            if (bool(self.get_parameter('lr_hysteresis_enabled').value)
+                    and self._last_single_side is not None):
+                side, why = self._last_single_side, 'hyst(%s)' % self._last_single_side
+            else:
+                side = 'left' if m < center_x else 'right'
+                why = 'center_x'
+        self._last_single_side = side
+        self._lr_dbg = '%s %s' % (side[0].upper(), why)
+        return side
+
     # --------------------------------------------------------------- detection
     def detect_lane(self, edge):
         """ROI 안에서 행별로 좌/우 차선 x좌표를 찾아 '그 순간'의 차선 중심과
@@ -193,12 +249,12 @@ class LaneDetectionNode(Node):
                 _, x_near = max(all_pts, key=lambda p: p[0])  # 가장 아래(근거리) 점
                 line_x = float(np.median([x for _, x in all_pts]))
                 line_poly = left_poly if left_poly is not None else right_poly
-                if x_near < center_x:      # 근거리에서 중심 왼쪽 -> 좌차선
+                if self._classify_single(float(x_near), center_x) == 'left':
                     left_detected, right_detected = True, False
                     left_x, right_x = line_x, None
                     left_pts, right_pts = all_pts, []
                     left_poly, right_poly = line_poly, None
-                else:                       # 근거리에서 중심 오른쪽 -> 우차선
+                else:
                     left_detected, right_detected = False, True
                     left_x, right_x = None, line_x
                     left_pts, right_pts = [], all_pts
@@ -249,6 +305,24 @@ class LaneDetectionNode(Node):
         else:
             raw_offset = 0.0
             confidence = 0.0  # 완전 미검출: 신뢰도 0
+
+        # 좌/우 신원 트래커 갱신(계승용). 좌/우가 최종 확정된 뒤(병합 반영) 각 선의 x 를 기록.
+        # 2선 프레임이 신원을 박는 이벤트; 매 프레임 갱신해 비교 기준이 낡지 않게 한다.
+        if bool(self.get_parameter('lr_track_enabled').value):
+            if left_detected or right_detected:
+                self._track_miss = 0
+                if left_detected:
+                    self._last_left_x = left_x
+                if right_detected:
+                    self._last_right_x = right_x
+                if left_detected and right_detected:
+                    self._last_single_side = None  # 2선=신원 확실 → 단일 히스테리시스 초기화
+            else:
+                self._track_miss += 1
+                if self._track_miss >= int(self.get_parameter('lr_track_reset_frames').value):
+                    self._last_left_x = None
+                    self._last_right_x = None      # 완전 소실 지속 → 콜드 리셋
+                    self._last_single_side = None
 
         return {
             'raw_offset': raw_offset,
@@ -342,12 +416,12 @@ class LaneDetectionNode(Node):
                     all_min = min(clusters[k][1] for k in remaining)
                     all_max = max(clusters[k][2] for k in remaining)
                     m = 0.5 * (all_min + all_max)
-                    if m < center_x:
+                    if self._classify_single(m, center_x) == 'left':
                         left_ref = m
-                        left_raw.append((y, all_max))
+                        left_raw.append((y, all_max))     # 좌 = 안쪽(오른쪽=max_x) 엣지 (변경 없음)
                     else:
                         right_ref = m
-                        right_raw.append((y, all_min))
+                        right_raw.append((y, all_min))    # 우 = 안쪽(왼쪽=min_x) 엣지 (변경 없음)
             elif left_ref is None:
                 # 우차선만 있음 → 우차선보다 min_lane_sep 이상 왼쪽인 클러스터로 좌차선 시작
                 cands = [k for k in remaining if right_ref - means[k] >= min_lane_sep]
@@ -415,11 +489,12 @@ class LaneDetectionNode(Node):
 
         if bool(self.get_parameter('debug_log').value):
             lc = result['lane_center']
+            lr = f" lr[{self._lr_dbg}]" if self._lr_dbg else ""
             self.get_logger().info(
                 f"lane_width_px={self.lane_width_px:.0f} "
                 f"L={int(result['left_detected'])} R={int(result['right_detected'])} "
                 f"lane_center={('%.0f' % lc) if lc is not None else 'None'} "
-                f"raw_offset={result['raw_offset']:+.3f} conf={result['confidence']:.2f}",
+                f"raw_offset={result['raw_offset']:+.3f} conf={result['confidence']:.2f}{lr}",
                 throttle_duration_sec=0.5,
             )
 
