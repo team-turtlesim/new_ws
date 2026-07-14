@@ -89,6 +89,16 @@ INTERPRET_PARAMS = {
     # ⚠️ 주의: 오검출(실측 최대 4연속)을 다 못 걸러 헛출발 위험 — conf 0.60 게이트에
     # 의존한다. 트랙에서 초록 여러 번 보여줘 헛출발 안 나는지 꼭 확인할 것.
     'green_start_frames': 2,
+    # 방향표지(Y자 갈래) 조향 — '처음 근접 기준 일회성 고정 회전' 튜닝(2026-07-14 사용자 확정).
+    # near_ratio=언제(거리), hold_sec=얼마나 오래(갈림길 통과시간·속도의존), magnitude=얼마나 세게.
+    'sign_bias_magnitude': 0.25,   # 0.35 -> 0.25 완만히(차선 이탈 방지)
+    'sign_near_ratio': 0.15,       # 0.25 -> 0.15 더 멀리서부터 회전 시작
+    'sign_bias_hold_sec': 3.0,     # 2.5 -> 3.0 처음 근접부터 회전 지속(살살+오래 붙이기)
+    # 차선 상실 페일세이프 완화 — 끊긴 차선에서 급정지 대신 관성 통과(2026-07-14 사용자 확정).
+    'min_confidence': 0.15,        # 0.2 -> 0.15 작은 차선공백을 'lost'로 안 봄
+    # ⚠️ throttle_slew 는 가·감속 모두에 적용. 0.2 로 낮추면 짧은 공백은 관성통과하지만
+    #    빨간불/아루코 '정지'도 그만큼 느려진다(cruise 0.18 기준 완전정지에 ~0.9s). 실주행 확인 요.
+    'throttle_slew_per_sec': 0.2,  # 0.6 -> 0.2 완만한 스로틀 변화(공백 관성통과)
 }
 
 
@@ -146,6 +156,7 @@ def generate_launch_description():
     gain = LaunchConfiguration('gain')
     yolo_start = LaunchConfiguration('yolo_start')
     yolo_arm_signoff = LaunchConfiguration('yolo_arm_signoff')
+    yolo_power_gate = LaunchConfiguration('yolo_power_gate')
 
     # yolo_start:=on|off -> 초기 YOLO 추론(전원) 상태 bool. yolo_node.active 와 interpret 의
     # 초기 _yolo_active_cmd 를 함께 맞춰(둘이 어긋나면 첫 wake 가 dedup 에 삼켜짐) 특정
@@ -227,7 +238,8 @@ def generate_launch_description():
                         '기본 OFF. bluesign:=true 면 opencv 의 파란 마스크(/opencv/image/blue)'
                         '상단 ROI 파란비율로 /sign/near 를 내고, interpret 이 이를 받아 갈림길 '
                         '근처에서 YOLO 전원(/yolo/active)을 켠다(ArUco 마커 대신 색 트리거). '
-                        'yolo_power_gate=true(기본)일 때만 실제로 YOLO 를 깨운다.',
+                        'yolo_power_gate:=true 일 때만 실제로 YOLO 를 깨운다(기본 false = YOLO '
+                        '항상 ON 이라 이 트리거는 무의미).',
         ),
         DeclareLaunchArgument(
             'yolo_start', default_value='on',
@@ -244,6 +256,14 @@ def generate_launch_description():
                         'wake 때 자동 무장되므로 false(기본). 표지판 구간부터 곧바로'
                         '(yolo_start:=on) 테스트해 7번(래치 후 sign_yolo_off_delay 뒤 off)을 '
                         '확인할 때만 true.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_power_gate', default_value='false',
+            description='YOLO 전원 자동 on/off 게이팅(초록불→off, 파랑/아루코→on, 표지판 5초→off). '
+                        'false(기본): 게이팅 끔 → YOLO 는 yolo_start 상태(기본 on)로 주행 내내 '
+                        '계속 켜져 신호등/표지판을 항상 본다(출발은 초록불 확정 self.started 로 '
+                        '그대로 동작 — 이 게이트와 무관). true: 예전 8단계 전원 흐름 복원(파랑/'
+                        '아루코 wake 필요).',
         ),
 
         # --- Perception + judgment/control-law + web (always) ---
@@ -274,6 +294,9 @@ def generate_launch_description():
                  # yolo_node.active 와 반드시 같은 값으로 맞춘다(dedup 어긋남 방지).
                  'yolo_start_active': yolo_active_start,
                  'sign_off_armed_start': ParameterValue(yolo_arm_signoff, value_type=bool),
+                 # 전원 게이팅 마스터 스위치. 기본 false → YOLO 항상 ON 주행(초록불→off,
+                 # 파랑/아루코→on, 5초→off 전부 비활성). true 면 예전 8단계 흐름 복원.
+                 'yolo_power_gate': ParameterValue(yolo_power_gate, value_type=bool),
              }]),
         Node(package='battery', executable='battery_node', name='battery_node',
              output='screen'),
@@ -313,9 +336,14 @@ def generate_launch_description():
         # 내보내며 죽지 않는다(models/README.md 참고).
         Node(package='yolo', executable='yolo_node', name='yolo_node',
              output='screen',
+             # 코어 격리: yolo 프로세스를 코어3 하나에만 핀(taskset) + onnxruntime 1스레드.
+             # → lane/제어 클러스터가 코어0-2 를 온전히 확보(30fps 조향 보호). yolo 는 코어3
+             #   격리 상태로 ~6.6fps(신호등/표지판 이벤트 감지엔 충분). imgsz=320 실측 기준.
+             prefix='taskset -c 3',
              # active = 초기 추론 on/off (yolo_start). interpret 의 yolo_start_active 와
              # 같은 값이어야 첫 wake 가 dedup 에 안 삼켜진다.
-             parameters=[{'active': yolo_active_start}],
+             parameters=[{'active': yolo_active_start,
+                          'num_threads': 1}],
              condition=IfCondition(yolo)),
 
         # --- ArUco marker detection (only with aruco:=true) ---

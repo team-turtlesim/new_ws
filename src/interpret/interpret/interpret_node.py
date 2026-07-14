@@ -96,10 +96,14 @@ class Judgment:
         self.started = False
         self._green_run = 0          # 강한 초록 연속 프레임 카운터(출발 게이트 디바운스)
         self._last_green_conf = 0.0  # 최근 프레임 초록 최고 conf(로그 가시화용)
-        # 방향표지 바이어스 상태(Y자 갈래 선택): sign_dir +1/-1/0 래치, 근접 마지막 시각.
+        # 방향표지 바이어스 상태(Y자 갈래 선택): 처음 근접(near-gate 첫 통과)한 순간에
+        # 방향을 래치하고, 그 시각부터 sign_bias_hold_sec 동안 고정 bias 를 준다(표지판이
+        # 프레임 밖으로 나가도 유지 = 일회성 회전). 창이 끝나면 해제하고, 표지판이 화면에서
+        # 사라질 때까지(_sign_refractory) 재래치를 막아 같은 표지판에 반복 반응하지 않는다.
         self.sign_bias_enabled = bool(node.get_parameter('sign_bias_enabled').value)
         self.sign_dir = 0
-        self.last_sign_near_time = None
+        self.first_sign_near_time = None   # 고정창 시작 시각(None=미래치)
+        self._sign_refractory = False      # 창 소비 후 표지판이 아직 안 사라짐 -> 재래치 금지
 
     # --- 시간필터 ---
     def filter_offset(self, raw_offset, detected, single_line):
@@ -186,27 +190,35 @@ class Judgment:
             else:
                 self._green_run = 0   # 초록 끊기면 카운터 리셋(연속 요구)
 
-        # 방향표지 near-gate + 래치: left/right 표지판이 '가까우면'(박스 높이비 ≥ 문턱)
-        # 그 방향으로 래치하고 근접 시각 갱신(hold 해제 타이머용). 멀면 무시(미리 안 꺾게).
+        # 방향표지 near-gate + 일회성 래치: left/right 표지판이 '가까우면'(박스 높이비 ≥ 문턱)
+        # '처음 근접'한 그 순간에 방향을 래치해 고정창(sign_bias_hold_sec)을 시작한다.
+        # 멀면 무시(미리 안 꺾게). 창 진행 중/소비 후엔 재래치하지 않는다(lane_bias 참고).
         self.sign_bias_enabled = bool(gp('sign_bias_enabled').value)
         if self.sign_bias_enabled:
             near_ratio = float(gp('sign_near_ratio').value)
             left_label = str(gp('left_sign_label').value)
             right_label = str(gp('right_sign_label').value)
             img_h = float(max(1, int(msg.image_height)))
+            near_dir = 0   # 이번 프레임에서 near 로 본 방향(0=없음, +1=left, -1=right)
             for d in msg.detections:
                 if float(d.confidence) < min_conf:
                     continue
                 if (float(d.height) / img_h) < near_ratio:   # near-gate: 가까울 때만
                     continue
                 if d.label == left_label:
-                    self.sign_dir = 1
-                    self.last_sign_near_time = self.node.get_clock().now()
-                    self.node.note_sign_latch()   # 표지판 인식 -> YOLO 자동 off 카운트다운 시작
+                    near_dir = 1
                 elif d.label == right_label:
-                    self.sign_dir = -1
-                    self.last_sign_near_time = self.node.get_clock().now()
-                    self.node.note_sign_latch()
+                    near_dir = -1
+            if near_dir != 0:
+                # 처음 근접한 순간에만 래치(고정창 시작). 이미 창이 진행 중이거나,
+                # 직전 창을 소비한 뒤 표지판이 아직 안 사라졌으면(refractory) 재래치 안 함.
+                if self.first_sign_near_time is None and not self._sign_refractory:
+                    self.sign_dir = near_dir
+                    self.first_sign_near_time = self.node.get_clock().now()
+                    self.node.note_sign_latch()   # (yolo_power_gate=true 때만 유효, 지금은 무해)
+            else:
+                # near 표지판이 화면에서 사라짐 -> 다음 표지판을 위해 재무장.
+                self._sign_refractory = False
 
     def on_aruco(self, msg):
         """aruco_node 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신."""
@@ -246,15 +258,19 @@ class Judgment:
         return stop, slow
 
     def lane_bias(self):
-        """방향표지 바이어스(Y자 갈래 선택). 근접 표지가 hold 시간 내면 그 방향 유지,
-        지나면(hold 초과) 0 복귀. 반환: 목표 offset 에 줄 치우침(0=중앙유지)."""
+        """방향표지 바이어스(Y자 갈래 선택). '처음 근접'한 순간부터 sign_bias_hold_sec 동안
+        방향을 고정 유지한다(표지판이 프레임 밖으로 나가도 유지 = 일회성 회전). 창이 끝나면
+        해제하고, 표지판이 화면에서 사라질 때까지 재래치를 막는다(_sign_refractory).
+        반환: 목표 offset 에 줄 치우침(0=중앙유지)."""
         gp = self.node.get_parameter
         if (not self.sign_bias_enabled or self.sign_dir == 0
-                or self.last_sign_near_time is None):
+                or self.first_sign_near_time is None):
             return 0.0
-        age = (self.node.get_clock().now() - self.last_sign_near_time).nanoseconds * 1e-9
+        age = (self.node.get_clock().now() - self.first_sign_near_time).nanoseconds * 1e-9
         if age > float(gp('sign_bias_hold_sec').value):
-            self.sign_dir = 0   # 갈림길 통과 완료 -> 해제
+            self.sign_dir = 0                 # 고정창 종료 -> bias 해제
+            self.first_sign_near_time = None
+            self._sign_refractory = True      # 표지판이 사라지기 전까지 재래치 금지
             return 0.0
         return float(self.sign_dir) * float(gp('sign_bias_magnitude').value)
 
