@@ -84,6 +84,7 @@ class Judgment:
         self.last_yolo_time = None
         self.aruco_enabled = bool(node.get_parameter('aruco_enabled').value)
         self.aruco_stop = False
+        self._aruco_did_stop = False   # 핸드오프: ArUco 마커로 정지한 적 있나(마커 소멸시 off 판정)
         self.last_aruco_time = None
         # 신호등 상태 래치: 빨간불→정지(True), 초록불→출발(False). 초기값 출발.
         # (순간 게이트가 아니라 '상태' — 초록불을 봐야 출발, 그전엔 계속 정지)
@@ -94,16 +95,21 @@ class Judgment:
         # 확정 = 강한 초록(conf≥green_start_confidence)이 green_start_frames 연속 — 오검출
         # 1~2프레임에 안 풀리게 디바운스한다.
         self.started = False
+        self._started_time = None    # 출발 확정 시각(신호등 재정지 쿨다운 기준)
         self._green_run = 0          # 강한 초록 연속 프레임 카운터(출발 게이트 디바운스)
         self._last_green_conf = 0.0  # 최근 프레임 초록 최고 conf(로그 가시화용)
         # 방향표지 바이어스 상태(Y자 갈래 선택): 처음 근접(near-gate 첫 통과)한 순간에
-        # 방향을 래치하고, 그 시각부터 sign_bias_hold_sec 동안 고정 bias 를 준다(표지판이
-        # 프레임 밖으로 나가도 유지 = 일회성 회전). 창이 끝나면 해제하고, 표지판이 화면에서
-        # 사라질 때까지(_sign_refractory) 재래치를 막아 같은 표지판에 반복 반응하지 않는다.
+        # 그 프레임의 방향(좌/우 중 conf 높은 쪽)으로 래치하고, 그 시각부터 sign_bias_hold_sec
+        # 동안 고정 bias 를 준다(표지판이 프레임 밖으로 나가도 유지 = 일회성 회전). 창이 끝나면
+        # 해제 + 표지판이 사라질 때까지(_sign_refractory) 재래치 금지.
+        # (모델이 한 표지판에 left/right 를 동시에 뱉는 이중검출이 있어, 배열 순서가 아니라
+        #  conf 높은 쪽으로 고른다. 단 첫 근접 프레임에서 유령이 더 높으면 틀릴 수 있음 —
+        #  누적 투표를 뺀 대신의 트레이드오프.)
         self.sign_bias_enabled = bool(node.get_parameter('sign_bias_enabled').value)
         self.sign_dir = 0
         self.first_sign_near_time = None   # 고정창 시작 시각(None=미래치)
         self._sign_refractory = False      # 창 소비 후 표지판이 아직 안 사라짐 -> 재래치 금지
+        self._sign_slow_time = None        # 표지판 최초 래치 시각(합류구간 감속 창 기준)
 
     # --- 시간필터 ---
     def filter_offset(self, raw_offset, detected, single_line):
@@ -169,8 +175,16 @@ class Judgment:
         self._last_green_conf = green_conf
         if self.traffic_light_enabled:
             if saw_red:
-                self.traffic_stop = True
-                self._green_run = 0
+                # 출발 직후 쿨다운(출발선 신호등 지나가는 구간) 동안엔 빨강을 무시한다 —
+                # 지나가며 뒷면/옆각도가 red 로 재검출돼도(실측 conf 0.93) 안 멈춘다.
+                # 쿨다운이 지나면 빨강이 정상 정지 → 한바퀴 후 결승 빨강은 잡는다. (2026-07-15)
+                cooldown = float(gp('traffic_restop_cooldown_sec').value)
+                in_cooldown = (self.started and self._started_time is not None
+                               and (self.node.get_clock().now() - self._started_time)
+                               .nanoseconds * 1e-9 < cooldown)
+                if not in_cooldown:
+                    self.traffic_stop = True
+                    self._green_run = 0
             elif saw_green:
                 self.traffic_stop = False
                 # 출발 게이트 해제는 엄격하게: 강한 초록(conf≥green_start_confidence)이
@@ -182,6 +196,7 @@ class Judgment:
                 if (not self.started
                         and self._green_run >= int(gp('green_start_frames').value)):
                     self.started = True   # 초록불 확정 -> 출발 게이트 영구 해제
+                    self._started_time = self.node.get_clock().now()  # 신호등 재정지 쿨다운 시작
                     self.node.get_logger().info(
                         '출발 게이트 해제: 초록불 확정(conf=%.2f, %d프레임 연속)'
                         % (green_conf, self._green_run))
@@ -199,32 +214,56 @@ class Judgment:
             left_label = str(gp('left_sign_label').value)
             right_label = str(gp('right_sign_label').value)
             img_h = float(max(1, int(msg.image_height)))
-            near_dir = 0   # 이번 프레임에서 near 로 본 방향(0=없음, +1=left, -1=right)
+            # 이번 프레임의 near+conf 통과 검출 중 방향별 최고 conf. 모델이 한 표지판에
+            # left/right 를 동시에 뱉는 이중검출이 있어, 배열 순서가 아니라 conf 로 고른다.
+            best_l = best_r = 0.0
             for d in msg.detections:
                 if float(d.confidence) < min_conf:
                     continue
                 if (float(d.height) / img_h) < near_ratio:   # near-gate: 가까울 때만
                     continue
                 if d.label == left_label:
-                    near_dir = 1
+                    best_l = max(best_l, float(d.confidence))
                 elif d.label == right_label:
-                    near_dir = -1
-            if near_dir != 0:
-                # 처음 근접한 순간에만 래치(고정창 시작). 이미 창이 진행 중이거나,
-                # 직전 창을 소비한 뒤 표지판이 아직 안 사라졌으면(refractory) 재래치 안 함.
-                if self.first_sign_near_time is None and not self._sign_refractory:
+                    best_r = max(best_r, float(d.confidence))
+            if best_l > 0.0 or best_r > 0.0:
+                # near 표지판 있음: 이 프레임 conf 높은 방향. 처음 근접이면 래치(고정창 시작).
+                near_dir = -1 if best_r > best_l else (1 if best_l > best_r else 0)
+                if near_dir != 0 and self.first_sign_near_time is None \
+                        and not self._sign_refractory:
                     self.sign_dir = near_dir
                     self.first_sign_near_time = self.node.get_clock().now()
+                    self._sign_slow_time = self.first_sign_near_time  # 합류구간 감속 창 기준 시각
                     self.node.note_sign_latch()   # (yolo_power_gate=true 때만 유효, 지금은 무해)
+                    # ★ 표지판↔마커 핸드오프: 12시 방향표지 보면 YOLO 끄고 ArUco 켠다.
+                    #   (마커 정지 시 YOLO 재개, 마커 소멸 시 ArUco off — on_aruco 참고)
+                    if bool(gp('sign_aruco_handoff_enabled').value):
+                        self.node.set_yolo_active(False, '12시 표지판')
+                        self.node.set_aruco_active(True, '12시 표지판')
+                    if bool(gp('sign_lr_track_off_enabled').value):
+                        self.node.set_lr_track(False, '12시 표지판(합류구간)')
+                    if bool(gp('sign_soften_enabled').value) and not self.node._sign_soften:
+                        self.node._sign_soften = True   # S자 곡선게인 -> 합류용 완만값
+                        self.node.get_logger().info('sign_soften -> ON (S자 곡선게인 완화)')
             else:
                 # near 표지판이 화면에서 사라짐 -> 다음 표지판을 위해 재무장.
                 self._sign_refractory = False
 
     def on_aruco(self, msg):
-        """aruco_node 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신."""
+        """aruco_node 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신.
+        핸드오프: 마커 등장(정지)→YOLO 재개, 마커 소멸(재출발)→ArUco off."""
+        gp = self.node.get_parameter
         self.last_aruco_time = self.node.get_clock().now()
-        self.aruco_enabled = bool(self.node.get_parameter('aruco_enabled').value)
-        self.aruco_stop = bool(msg.data) if self.aruco_enabled else False
+        self.aruco_enabled = bool(gp('aruco_enabled').value)
+        new_stop = bool(msg.data) if self.aruco_enabled else False
+        if bool(gp('sign_aruco_handoff_enabled').value):
+            if new_stop and not self.aruco_stop:               # 마커 등장(정지) -> YOLO 다시 켜기
+                self.node.set_yolo_active(True, 'ArUco 마커 정지')
+                self._aruco_did_stop = True
+            elif (not new_stop) and self.aruco_stop and self._aruco_did_stop:  # 마커 소멸 -> ArUco off
+                self.node.set_aruco_active(False, '마커 사라짐(재출발)')
+                self._aruco_did_stop = False
+        self.aruco_stop = new_stop
 
     # --- 인지 중재: 정지/감속 판정 ---
     def perception_stop_slow(self):
@@ -437,7 +476,7 @@ class Controller:
         self.integral = 0.0
 
     def step(self, offset, confidence, stop, slow, bias=0.0, throttle_scale_extra=1.0,
-             heading=0.0):
+             heading=0.0, cruise_override=None):
         """offset PID + 스로틀 목표(정지/감속 반영) + 슬루 -> (steering, throttle, diag).
         bias: 방향표지 바이어스(목표 offset 치우침; 0=중앙유지). P/I 오차에만 반영,
         미분(D)은 원 offset 기준(setpoint 변화에 미분 튐 방지).
@@ -460,6 +499,13 @@ class Controller:
         sched_off_lo = float(gp('sched_offset_lo').value)
         sched_off_hi = float(gp('sched_offset_hi').value)
         steer_limit = float(gp('steer_limit').value)
+        # 표지판 후 합류구간: S자용 공격적 곡선게인을 완만값으로 되돌린다(과조향·이탈 방지).
+        # 표지판 전 S자는 위 INTERPRET_PARAMS 값 그대로. _sign_soften 은 표지판 래치 시 켜짐.
+        if getattr(self.node, '_sign_soften', False):
+            kp_curve = float(gp('sign_soft_kp_offset_curve').value)
+            sched_off_lo = float(gp('sign_soft_sched_offset_lo').value)
+            sched_off_hi = float(gp('sign_soft_sched_offset_hi').value)
+            steer_limit = float(gp('sign_soft_steer_limit').value)
         steer_sign = float(gp('steer_sign').value)
         d_limit = float(gp('d_offset_limit').value)
         alpha = clip(float(gp('steer_smooth_alpha').value), 0.05, 1.0)
@@ -502,7 +548,9 @@ class Controller:
         steering = clip(self.steer_cmd_filtered, -1.0, 1.0)
 
         # 스로틀: lane lost 아니면 cruise; 곡선(w↑) 감속; 인지 정지/감속; 슬루 제한.
-        cruise = float(gp('cruise_throttle').value)
+        # cruise_override 있으면(표지판 합류구간 감속) cruise_throttle 대신 그 절대값 사용.
+        cruise = (float(gp('cruise_throttle').value)
+                  if cruise_override is None else float(cruise_override))
         max_throttle = float(gp('max_throttle').value)
         slew = float(gp('throttle_slew_per_sec').value)
         curve_thr_scale = float(gp('curve_throttle_scale').value)
@@ -578,6 +626,13 @@ class InterpretNode(Node):
 
         # --- 스로틀 ---------------------------------------------------------
         self.declare_parameter('cruise_throttle', 0.0)  # 0 => 조향부터 검증
+        # 12시 표지판 합류구간 감속: 표지판 래치 후 [delay, delay+duration) 구간엔 cruise 를
+        # sign_slow_throttle(절대값)로 낮춘다 — 길 합쳐지는 데서 속도 과다로 이탈하던 것 방지.
+        # (2026-07-15) 기본: 표지판 후 3초부터 5초간 0.19, 그 외엔 cruise_throttle(예:0.21).
+        self.declare_parameter('sign_slow_enabled', False)   # 표지판 감속 기본 OFF (2026-07-15 요청)
+        self.declare_parameter('sign_slow_delay_sec', 3.0)
+        self.declare_parameter('sign_slow_duration_sec', 5.0)
+        self.declare_parameter('sign_slow_throttle', 0.19)
         self.declare_parameter('max_throttle', 0.30)
         self.declare_parameter('throttle_slew_per_sec', 0.6)  # ramp rate
         # 곡선 감속: 조향 스케줄과 같은 w 로 throttle 을 줄인다("코너에서 브레이크").
@@ -673,11 +728,29 @@ class InterpretNode(Node):
         self.declare_parameter('green_start_confidence', 0.60)
         # 10 = 오검출(실측 최대 4연속)을 확실히 거른다. 진짜 초록불은 연속 잡히니 여유.
         self.declare_parameter('green_start_frames', 10)
+        # 출발(초록 확정) 후 이 시간(초) 동안은 빨강을 무시 — 출발선 신호등 지나가는 구간의
+        # red 재검출로 안 멈추게. 이후엔 빨강 정상 정지(한바퀴 후 결승). '통과시간<이 값<랩타임'.
+        self.declare_parameter('traffic_restop_cooldown_sec', 20.0)
         self.declare_parameter('red_label', 'red_light')
         self.declare_parameter('green_label', 'green_light')
         # YOLO 전원 게이트(자동 on/off로 CPU 절약): 초록불 출발 순간 off, ArUco 마커
         # 인지 시 on. False 면 이 자동 게이팅을 끈다(YOLO 계속 켜둠 — 링/벤치 테스트).
         self.declare_parameter('yolo_power_gate', True)
+        # 표지판↔마커 핸드오프(2026-07-15): 12시 방향표지 보면 YOLO off + ArUco on,
+        # ArUco 마커로 정지하면 YOLO on, 마커 소멸(재출발)하면 ArUco off. yolo_power_gate 와
+        # 독립(기존 green/marker 게이트와 별개 경로). 기본 True.
+        self.declare_parameter('sign_aruco_handoff_enabled', True)
+        # 12시 표지판 보면 lane_node 의 lr_track(좌/우 트래킹)을 끈다(/lr_track_active=False).
+        # 합류(갈림길 이후) 구간에서 lr_track 이 오히려 이탈을 유발 → 사용자 요청. 기본 True.
+        self.declare_parameter('sign_lr_track_off_enabled', True)
+        # 12시 표지판 후 합류구간: S자용으로 공격적으로 튜닝한 곡선 게인(kp_offset_curve /
+        # sched_offset_lo·hi / steer_limit)을 아래 완만값으로 되돌린다 → 합류 시 과조향·이탈
+        # 방지. 표지판 '전' S자는 그대로(INTERPRET_PARAMS 값) 유지. 기본 True. (2026-07-15)
+        self.declare_parameter('sign_soften_enabled', True)
+        self.declare_parameter('sign_soft_kp_offset_curve', 0.45)  # S자 0.5 -> 완만 0.45
+        self.declare_parameter('sign_soft_sched_offset_lo', 0.15)  # S자 0.06 -> 곡선반응 늦춤
+        self.declare_parameter('sign_soft_sched_offset_hi', 0.30)  # S자 0.25 -> 곡선게인 최대 늦춤
+        self.declare_parameter('sign_soft_steer_limit', 0.8)       # S자 1.0 -> 조향범위 축소
         self.declare_parameter('yolo_active_topic', '/yolo/active')
         # 초기 YOLO 추론(전원) 상태 = 부팅 시 /yolo/active. 런치 yolo_start:=on|off 가
         # yolo_node.active 와 함께 이 값을 맞춘다(둘이 어긋나면 set_yolo_active 의 dedup 이
@@ -772,6 +845,22 @@ class InterpretNode(Node):
         # sign_off_armed_start(기본 False — 출발 phase 는 초록불→off 가 관장).
         self._sign_off_armed = bool(self.get_parameter('sign_off_armed_start').value)
         self._sign_latch_time = None   # 방향표지 최초 래치 시각(카운트다운 기준). None=미시작
+
+        # ArUco 전원 게이트 발행(/aruco/active, latched). 방향표지(YOLO left/right_sign)가
+        # 근접 래치되는 순간(좌/우 회전 시작) True 를 1회 발행해 12시 마커 구간에서만 ArUco
+        # 검출을 깨운다. aruco_node 는 기본 active=False(idle)로 뜬다. 켜기만 하고 자동 off 는
+        # 없다(마커 지나도 계속 ON — 필요 시 추가). yolo_power_gate 와 무관하게 항상 작동.
+        self.declare_parameter('aruco_active_topic', '/aruco/active')
+        self.aruco_active_pub = self.create_publisher(
+            Bool, str(self.get_parameter('aruco_active_topic').value), gate_qos)
+        self._aruco_active_cmd = False   # 초기 = aruco_node 기본 active=False 와 일치
+
+        # lr_track 원격 제어 발행(/lr_track_active, volatile). 12시 표지판 보면 False 를 발행해
+        # lane_node 의 lr_track(좌/우 트래킹)을 끈다. 발행 안 하면 lane_node 는 자기 param 사용.
+        self.lr_track_pub = self.create_publisher(Bool, '/lr_track_active', 10)
+        self._lr_track_cmd = True   # 상태(중복 발행 방지). 초기 on, 시작 시엔 발행 안 함
+        # 표지판 후 합류구간 곡선게인 완화 활성(영구, lr_track off 와 동반). Controller 가 읽음.
+        self._sign_soften = False
 
         # YOLO 검출 구독(정지/감속 게이팅용). 항상 구독하되 gate 는 yolo_enabled 로 제어.
         self.yolo_sub = self.create_subscription(
@@ -879,8 +968,10 @@ class InterpretNode(Node):
         bias = self.judgment.lane_bias()
         # heading 은 램프 목표를 실제로 쓰는 프레임에서만 조향에 들어간다(흰 차선 무영향).
         heading = self.ramp.heading if use_ramp else 0.0
+        # 12시 표지판 합류구간 감속: 표지판 래치 후 [delay,+duration) 창이면 cruise 낮춤.
+        cruise_ovr = self.sign_slow_cruise()
         steering, throttle, diag = self.controller.step(
-            offset, confidence, stop, slow, bias, thr_scale, heading)
+            offset, confidence, stop, slow, bias, thr_scale, heading, cruise_override=cruise_ovr)
         self.publish_control(steering, throttle)
 
         # 표지판 인식 후 YOLO 자동 off(transition 7): 래치 후 지연 지나면 1회 off.
@@ -968,6 +1059,48 @@ class InterpretNode(Node):
         self.yolo_active_pub.publish(m)
         self.get_logger().info(
             'YOLO 전원 -> %s%s' % ('ON' if on else 'OFF', ' (%s)' % reason if reason else ''))
+
+    def sign_slow_cruise(self):
+        """12시 표지판 래치 후 [sign_slow_delay, +duration) 구간이면 감속 cruise(절대값)를
+        반환, 아니면 None(정상 cruise_throttle 사용). 길 합쳐지는 구간만 속도를 낮춰 이탈 방지."""
+        if not bool(self.get_parameter('sign_slow_enabled').value):
+            return None   # 표지판 감속 비활성(기본 off)
+        t = self.judgment._sign_slow_time
+        if t is None:
+            return None
+        gp = self.get_parameter
+        age = (self.get_clock().now() - t).nanoseconds * 1e-9
+        delay = float(gp('sign_slow_delay_sec').value)
+        dur = float(gp('sign_slow_duration_sec').value)
+        if delay <= age < delay + dur:
+            return float(gp('sign_slow_throttle').value)
+        return None
+
+    def set_lr_track(self, on, reason=''):
+        """lane_node 의 lr_track(좌/우 트래킹) 원격 on/off(/lr_track_active). 상태 바뀔 때만 발행.
+        12시 표지판 래치 시 False 로 호출 → 합류구간에서 lr_track 을 끈다."""
+        on = bool(on)
+        if on == self._lr_track_cmd:
+            return
+        self._lr_track_cmd = on
+        m = Bool()
+        m.data = on
+        self.lr_track_pub.publish(m)
+        self.get_logger().info(
+            'lr_track -> %s%s' % ('ON' if on else 'OFF', ' (%s)' % reason if reason else ''))
+
+    def set_aruco_active(self, on, reason=''):
+        """ArUco 전원 게이트 명령(/aruco/active). 상태가 바뀔 때만 발행(중복 방지).
+        방향표지 근접 래치 시 True 로 호출 → aruco_node 가 검출을 재개한다."""
+        on = bool(on)
+        if on == self._aruco_active_cmd:
+            return
+        self._aruco_active_cmd = on
+        m = Bool()
+        m.data = on
+        self.aruco_active_pub.publish(m)
+        self.get_logger().info(
+            'ArUco 전원 -> %s%s' % ('ON' if on else 'OFF', ' (%s)' % reason if reason else ''))
 
     # ------------------------------------------------------------------ config
     def load_steer_trim(self):

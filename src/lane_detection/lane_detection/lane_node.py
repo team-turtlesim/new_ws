@@ -24,6 +24,7 @@ import yaml
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool
 
 from interface.msg import LaneDetection
 
@@ -115,6 +116,7 @@ class LaneDetectionNode(Node):
         self.lane_width_px = None
         # 좌/우 신원 트래킹 상태(lr_track_enabled): 2선 프레임에서 각 선 마지막 x 저장 →
         # 단일선으로 줄면 가까운 쪽 라벨 계승.
+        self._lr_track_override = None  # None=param 사용, True/False=interpret 원격 오버라이드(/lr_track_active)
         self._last_left_x = None      # 좌차선 마지막 관측 x (median)
         self._last_right_x = None     # 우차선 마지막 관측 x
         self._track_miss = 0          # 연속 완전미검출 프레임 수(스테일 판정용)
@@ -135,6 +137,9 @@ class LaneDetectionNode(Node):
             image_qos,
         )
         self.detection_pub = self.create_publisher(LaneDetection, detection_topic, 10)
+        # lr_track 원격 제어 구독(/lr_track_active, interpret 발행). 12시 표지판 후 False 오면
+        # lr_track 을 끈다(합류구간 방해 방지). 미수신(None)이면 param(lr_track_enabled) 사용.
+        self.create_subscription(Bool, '/lr_track_active', self._on_lr_track, 10)
         self.debug_pub = None
         if self.debug_image:
             self.debug_pub = self.create_publisher(CompressedImage, debug_topic, image_qos)
@@ -175,13 +180,23 @@ class LaneDetectionNode(Node):
         return edge
 
     # ------------------------------------------------------ 좌/우 신원 분류(계승)
+    def _on_lr_track(self, msg):
+        """interpret 의 lr_track 원격 on/off(/lr_track_active). 12시 표지판 후 False."""
+        self._lr_track_override = bool(msg.data)
+
+    def _lr_track_on(self):
+        """lr_track 유효 여부: 원격 오버라이드가 있으면 그것, 없으면 param(lr_track_enabled)."""
+        if self._lr_track_override is not None:
+            return self._lr_track_override
+        return bool(self.get_parameter('lr_track_enabled').value)
+
     def _classify_single(self, m, center_x):
         """단일선을 좌/우로 판정. 우선순위: (1) 저장된 좌/우 x 중 가까운 쪽 계승,
         (2) 애매하면(둘 다 max_jump 초과) 직전 단일선 라벨 유지(히스테리시스), (3) 그도
         없으면 center_x 폴백. lr_track_enabled=False 면 기존 center_x 동작 그대로."""
-        if not bool(self.get_parameter('lr_track_enabled').value):
+        if not self._lr_track_on():
             self._lr_dbg = ''
-            return 'left' if m < center_x else 'right'          # 기존 동작
+            return 'left' if m < center_x else 'right'          # 기존 동작(또는 표지판 후 off)
         max_jump = float(self.get_parameter('lr_track_max_jump_px').value)
         ll, rl = self._last_left_x, self._last_right_x
         side, why = None, ''
@@ -308,7 +323,7 @@ class LaneDetectionNode(Node):
 
         # 좌/우 신원 트래커 갱신(계승용). 좌/우가 최종 확정된 뒤(병합 반영) 각 선의 x 를 기록.
         # 2선 프레임이 신원을 박는 이벤트; 매 프레임 갱신해 비교 기준이 낡지 않게 한다.
-        if bool(self.get_parameter('lr_track_enabled').value):
+        if self._lr_track_on():
             if left_detected or right_detected:
                 self._track_miss = 0
                 if left_detected:

@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, Int32
 
@@ -90,6 +90,14 @@ class ArucoNode(Node):
         self.declare_parameter('jpeg_quality', 80)
         self.declare_parameter('debug_log', True)
 
+        # --- 전원 게이트 (CPU 확보) -----------------------------------------
+        # active=False 면 image_callback 을 통째로 스킵(디코드·검출·발행 안 함).
+        # /aruco/active(Bool, latched) 로 런타임 토글 — interpret 가 방향표지(YOLO
+        # left/right_sign) 근접 래치 시 True 를 발행해 12시 마커 구간에서만 ArUco 를 깨운다.
+        # 기본 False(idle) — 표지판 보기 전엔 완전히 쉰다. (2026-07-14)
+        self.declare_parameter('active', False)
+        self.declare_parameter('active_topic', '/aruco/active')
+
         image_topic = str(self.get_parameter('image_topic').value)
         self.debug_topic = str(self.get_parameter('debug_topic').value)
         self.debug_image = bool(self.get_parameter('debug_image').value)
@@ -97,6 +105,7 @@ class ArucoNode(Node):
         if not 0 <= self.jpeg_quality <= 100:
             raise ValueError('jpeg_quality must be in range [0, 100]')
         self.debug_log = bool(self.get_parameter('debug_log').value)
+        self.active = bool(self.get_parameter('active').value)
 
         # --- 검출기 구성 ----------------------------------------------------
         primary_name = str(self.get_parameter('aruco_dict').value)
@@ -133,6 +142,15 @@ class ArucoNode(Node):
         self.subscription = self.create_subscription(
             CompressedImage, image_topic, self.image_callback, cam_qos)
 
+        # 전원 게이트 구독. VOLATILE(비latched): 낡은(유령 런치) latched 메시지에 안 깨어나게.
+        # interpret 와 aruco 는 같이 떠서 실시간 전달되므로 late-join 이슈 없음. (2026-07-15
+        # 유령 interpret 의 stale /aruco/active=true 로 시작부터 켜지던 문제 방지.)
+        active_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                                reliability=ReliabilityPolicy.RELIABLE,
+                                durability=DurabilityPolicy.VOLATILE)
+        self.active_sub = self.create_subscription(
+            Bool, str(self.get_parameter('active_topic').value), self.on_active, active_qos)
+
         self.get_logger().info(
             'aruco node started (cv2 %s, %s API):\n'
             '  image_topic=%s\n'
@@ -152,7 +170,18 @@ class ArucoNode(Node):
         )
 
     # ------------------------------------------------------------------ callbk
+    def on_active(self, msg: Bool):
+        """전원 게이트 토글(/aruco/active). 상태가 바뀔 때만 로그."""
+        new_active = bool(msg.data)
+        if new_active != self.active:
+            self.get_logger().info(
+                'ArUco 검출 %s' % ('재개(on)' if new_active else '일시정지(off, CPU 확보)'))
+        self.active = new_active
+
     def image_callback(self, msg: CompressedImage):
+        # 전원 게이트: 꺼져 있으면 디코드·검출·발행 전부 건너뛴다(CPU 확보).
+        if not self.active:
+            return
         frame = self.decode(msg)
         if frame is None:
             return

@@ -71,7 +71,7 @@ INTERPRET_PARAMS = {
     'kp_offset': 0.25,       # 직진 kp: 0.45 -> 0.25 루프게인 축소(리밋사이클 억제)
     'kd_offset': 0.16,       # 0.12 -> 0.16 감쇠 강화(offset 깨끗해 여유 있음)
     'ki_offset': 0.0,        # 0.2 -> 0.0 적분 위상지연이 뱀주행 유발 -> 비활성
-    'steer_smooth_alpha': 0.30,  # 0.35 -> 0.30 출력 평활 강화
+    'steer_smooth_alpha': 0.50,  # 0.30 -> 0.50 조향 응답성↑(S자 지연 완화) 2026-07-14 저녁
     'd_offset_limit': 2.0,
     # 게인 스케줄링(직진<->곡선, |offset| 기준). 곡선에서 offset 이 벌어지면 kp↑.
     # 07-08: 속도↑ 시 곡선 언더스티어(못 돎/이탈) -> 곡선 반응을 더 일찍(lo/hi↓) +
@@ -91,11 +91,11 @@ INTERPRET_PARAMS = {
     'green_start_frames': 2,
     # 방향표지(Y자 갈래) 조향 — '처음 근접 기준 일회성 고정 회전' 튜닝(2026-07-14 사용자 확정).
     # near_ratio=언제(거리), hold_sec=얼마나 오래(갈림길 통과시간·속도의존), magnitude=얼마나 세게.
-    'sign_bias_magnitude': 0.25,   # 0.35 -> 0.25 완만히(차선 이탈 방지)
+    'sign_bias_magnitude': 0.20,   # 완만히(차선 이탈 방지) — 2026-07-14 저녁 확정
     'sign_near_ratio': 0.15,       # 0.25 -> 0.15 더 멀리서부터 회전 시작
-    'sign_bias_hold_sec': 3.0,     # 2.5 -> 3.0 처음 근접부터 회전 지속(살살+오래 붙이기)
+    'sign_bias_hold_sec': 2.0,     # 처음 근접부터 회전 지속(갈림길 통과) — 2026-07-14 저녁 확정
     # 차선 상실 페일세이프 완화 — 끊긴 차선에서 급정지 대신 관성 통과(2026-07-14 사용자 확정).
-    'min_confidence': 0.15,        # 0.2 -> 0.15 작은 차선공백을 'lost'로 안 봄
+    'min_confidence': 0.20,        # 차선 lost 판정 문턱 — 2026-07-14 저녁 0.15->0.20 재확정
     # ⚠️ throttle_slew 는 가·감속 모두에 적용. 0.2 로 낮추면 짧은 공백은 관성통과하지만
     #    빨간불/아루코 '정지'도 그만큼 느려진다(cruise 0.18 기준 완전정지에 ~0.9s). 실주행 확인 요.
     'throttle_slew_per_sec': 0.2,  # 0.6 -> 0.2 완만한 스로틀 변화(공백 관성통과)
@@ -120,35 +120,16 @@ RAMP_PARAMS = {
 }
 
 
-# bluesign_node(파란 표지판 트리거) 튜닝 파라미터. opencv_node 가 발행한 파란 마스크
-# (/opencv/image/blue)의 상단 ROI 파란비율로 /sign/near 를 낸다. 노드 기본값과 동일(동작
-# 불변) — 여기서 바꾸면 적용된다. 라이브 튜닝: ros2 param set /bluesign_node <이름> <값>.
-# 트리거는 '켜기'만 하므로(오검출=CPU만 잠깐 낭비, 놓침이 더 위험) 민감하게 두는 게 안전.
-BLUESIGN_PARAMS = {
-    # 상단 ROI(프레임 대비 비율). 표지판은 화면 위쪽에 먼저 나타난다.
-    'roi_top_frac': 0.0,
-    'roi_bottom_frac': 0.5,   # 상단 절반만 본다(하단은 차선이라 무시)
-    'roi_left_frac': 0.0,
-    'roi_right_frac': 1.0,
-    # 트리거 임계 + 디바운스/히스테리시스.
-    'blue_frac_on': 0.02,     # ROI 파란비율 2% 이상 -> 후보
-    'blue_frac_off': 0.01,    # 1% 미만 -> 해제(히스테리시스)
-    'on_frames': 2,           # 2프레임 연속 -> near=True (민감)
-    'off_frames': 8,          # 8프레임 연속 미만 -> near=False (깜빡임 억제)
-    'debug_log': False,       # per-frame 파란비율/near 로그 — 튜닝 시 true
-}
-
-
 def generate_launch_description():
     vehicle_config_path = get_vehicle_config_path()
     cfg = {'vehicle_config_file': vehicle_config_path}
 
     drive = LaunchConfiguration('drive')
+    monitor = LaunchConfiguration('monitor')
     debug_overlay = LaunchConfiguration('debug_overlay')
     yolo = LaunchConfiguration('yolo')
     aruco = LaunchConfiguration('aruco')
     ramp = LaunchConfiguration('ramp')
-    bluesign = LaunchConfiguration('bluesign')
     ramp_start = LaunchConfiguration('ramp_start')
     throttle = LaunchConfiguration('throttle')
     green_start = LaunchConfiguration('green_start')
@@ -173,26 +154,32 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'drive', default_value='false',
-            description='Also start control_node (actuator driver).',
+            'drive', default_value='true',
+            description='Start control_node (actuator driver). 기본 ON(실주행). 벤치/정적 '
+                        '테스트로 액추에이터 없이 띄우려면 drive:=false.',
+        ),
+        DeclareLaunchArgument(
+            'monitor', default_value='false',
+            description='Start monitor_node (Flask 웹 대시보드). 기본 OFF — 주행 중엔 '
+                        'CPU(플라스크+jpeg 인코딩)를 먹어 파이프라인 fps 를 갉는다. 튜닝/진단 '
+                        '때만 monitor:=true 로 켜 대시보드(http://<board>:5000) 를 본다.',
         ),
         DeclareLaunchArgument(
             'debug_overlay', default_value='true',
             description='Point the monitor edge pane at the lane debug overlay.',
         ),
         DeclareLaunchArgument(
-            'yolo', default_value='false',
-            description='Also start yolo_node (object detection) + show its overlay '
-                        'pane on the dashboard. 기본 OFF (흰라인 수동주행). yolo:=true 면 '
-                        'interpret 가 yolo_enabled=true 기본이라 검출이 제어에 물린다 '
-                        '(신호등 정지/출발, 방향표지 바이어스).',
+            'yolo', default_value='true',
+            description='Start yolo_node (object detection). 기본 ON(실주행). interpret 가 '
+                        'yolo_enabled=true 기본이라 검출이 제어에 물린다(신호등 정지/출발, '
+                        '방향표지 바이어스). YOLO 없이 흰라인만 수동주행하려면 yolo:=false.',
         ),
         DeclareLaunchArgument(
-            'aruco', default_value='false',
-            description='Also start aruco_node (ArUco 마커 검출) + show its overlay '
-                        'pane on the dashboard. 기본 OFF (오늘 흰라인 주행). aruco:=true '
-                        '면 /detected_marker_id + /aruco_stop 를 발행하고 interpret 가 '
-                        'aruco_enabled=true 기본이라 정지에 물린다.',
+            'aruco', default_value='true',
+            description='Start aruco_node (ArUco 마커 검출). 기본 ON(실주행). 표지판→마커 '
+                        '핸드오프(sign_aruco_handoff)에 필수 — 없으면 방향표지 후 YOLO 가 꺼진 채 '
+                        '안 돌아온다. 마커 미사용 구간만 테스트하려면 aruco:=false + '
+                        'sign_aruco_handoff_enabled:=false 로 함께 끈다.',
         ),
         DeclareLaunchArgument(
             'ramp', default_value='false',
@@ -208,17 +195,18 @@ def generate_launch_description():
                         '가드를 건너뛰고 노란차선을 첫 프레임부터 추종(링 출발 테스트).',
         ),
         DeclareLaunchArgument(
-            'throttle', default_value='0.0',
-            description='interpret 의 cruise_throttle(순항 스로틀). 기본 0.0 = 정지'
-                        '(안전). 출발/속도는 여기서 지정하거나 실행 중 라이브로: '
-                        'ros2 param set /interpret_node cruise_throttle 0.15',
+            'throttle', default_value='0.20',
+            description='interpret 의 cruise_throttle(순항 스로틀). 기본 0.20 (2026-07-14 저녁 '
+                        '확정 순항속도). ⚠️ green_start:=false 면 런치 즉시 이 속도로 출발한다 '
+                        '— 정지로 띄우려면 throttle:=0.0, 또는 green_start:=true 로 초록불 대기. '
+                        '라이브: ros2 param set /interpret_node cruise_throttle 0.15',
         ),
         DeclareLaunchArgument(
-            'green_start', default_value='false',
-            description='초록불 출발 게이트(require_green_start). false(기본): 초록불 없이 '
-                        'throttle 만으로 출발(흰라인 수동주행 — throttle 을 직접 조절). '
-                        'true: 런치 직후 정지 대기하다 첫 초록불을 봐야 출발(대회 실전 '
-                        '출발선 + 초록시 YOLO 자동 off). yolo:=true 일 때만 의미.',
+            'green_start', default_value='true',
+            description='초록불 출발 게이트(require_green_start). true(기본): 런치 직후 정지 '
+                        '대기하다 첫 초록불을 봐야 출발(대회 실전 출발선). throttle 기본 0.20 이라 '
+                        '초록 확정 시 자동 순항. false: 초록불 없이 throttle 만으로 즉시 출발 '
+                        '(벤치/흰라인 테스트). yolo:=true 일 때만 의미.',
         ),
         DeclareLaunchArgument(
             'exposure', default_value='156',
@@ -231,15 +219,6 @@ def generate_launch_description():
             description='USB 카메라 게인(0~255). 밝기 조절의 주 레버(fps 무관, 노이즈↑). '
                         '너무 밝아 옆 조명이 잡히면 낮추고, 흰선 깜빡이면 올린다. '
                         '(2026-07-14 대회장 확정값 20). 라이브 튜닝: python3 ~/cam.py <exp> <gain>',
-        ),
-        DeclareLaunchArgument(
-            'bluesign', default_value='false',
-            description='Start bluesign_node (파란 표지판 트리거) + 대시보드 BlueSign 패널. '
-                        '기본 OFF. bluesign:=true 면 opencv 의 파란 마스크(/opencv/image/blue)'
-                        '상단 ROI 파란비율로 /sign/near 를 내고, interpret 이 이를 받아 갈림길 '
-                        '근처에서 YOLO 전원(/yolo/active)을 켠다(ArUco 마커 대신 색 트리거). '
-                        'yolo_power_gate:=true 일 때만 실제로 YOLO 를 깨운다(기본 false = YOLO '
-                        '항상 ON 이라 이 트리거는 무의미).',
         ),
         DeclareLaunchArgument(
             'yolo_start', default_value='on',
@@ -277,7 +256,17 @@ def generate_launch_description():
              output='screen'),
         Node(package='lane_detection', executable='lane_node',
              name='lane_detection_node', output='screen',
-             parameters=[cfg, {'lr_track_enabled': True}]),  # 좌/우 신원 트래킹 기본 ON(실주행 검증됨)
+             parameters=[cfg, {
+                 'lr_track_enabled': True,     # 좌/우 신원 트래킹 기본 ON(실주행 검증됨)
+                 # debug 오버레이(/lane_detection/image/debug)는 monitor 켤 때만 생성 —
+                 # 28fps 로 매 프레임 그리고 jpeg 인코딩해 CPU 를 먹는다(주행 중엔 불필요).
+                 'debug_image': ParameterValue(monitor, value_type=bool),
+                 # 합류지점 단일선의 두 윤곽(속 빈 두꺼운 선)을 좌/우 두 차선으로 오인 방지:
+                 # 두 검출이 이미지폭의 이 비율(0.35×320≈112px)보다 가까우면 두 차선으로
+                 # 씨앗 안 심음. 실제 차선폭(~0.556)은 그대로 두 차선; 상한은 lane_width_min
+                 # (0.42) 아래로 둬 진짜 두 차선은 안 놓친다. (2026-07-14 사용자 확정)
+                 'min_lane_sep_ratio': 0.35,   # 0.2 -> 0.35
+             }]),
         # interpret: LaneDetection(인지) -> 시간필터/판단 + offset PID(제어결정)
         #            -> LaneInfo(디버그) + Control(/control). 이벤트구동.
         Node(package='interpret', executable='interpret_node',
@@ -312,12 +301,13 @@ def generate_launch_description():
                  'ramp_debug': ParameterValue(ramp, value_type=bool),
                  # Ramp 패널 = 노란 마스크로 돌린 lane_node 의 오버레이.
                  'ramp_debug_topic': '/yellow_lane/image/debug',
-                 # BlueSign 패널 = bluesign_node 의 파란 마스크 오버레이(ROI+파란비율+상태).
-                 'bluesign_debug': ParameterValue(bluesign, value_type=bool),
                  # 대시보드 이미지 갱신 주기(ms). 낮출수록 화면 부드럽지만 CPU↑ (실제
                  # 파이프라인 fps 를 갉아먹을 수 있음). 100=~10fps(기본), 50=~20fps.
                  'image_refresh_interval_ms': 50,
-             }]),
+             }],
+             # 대시보드는 주행 중 CPU(플라스크+jpeg 인코딩)를 먹어 파이프라인 fps 를 갉으므로
+             # 기본 OFF. 튜닝/진단 때만 monitor:=true 로 켠다. (2026-07-15 사용자 요청)
+             condition=IfCondition(monitor)),
 
         # --- Ramp (yellow) perception (only with ramp:=true) ---
         # ramp_node 는 lane_node 의 사본이다(알고리즘 동일: 행별 클러스터 추적 + 단독선일
@@ -327,7 +317,9 @@ def generate_launch_description():
         # 트랙 검증이 끝난 흰 차선 주행까지 건드린다. 지금은 같지만 앞으로 갈라진다.
         Node(package='ramp_detection', executable='ramp_node',
              name='ramp_detection_node', output='screen',
-             parameters=[cfg, RAMP_PARAMS],
+             # debug 오버레이(/yellow_lane/image/debug)는 monitor 켤 때만 생성.
+             parameters=[cfg, RAMP_PARAMS, {
+                 'debug_image': ParameterValue(monitor, value_type=bool)}],
              condition=IfCondition(ramp)),
 
         # --- Object detection (only with yolo:=true) ---
@@ -343,22 +335,22 @@ def generate_launch_description():
              # active = 초기 추론 on/off (yolo_start). interpret 의 yolo_start_active 와
              # 같은 값이어야 첫 wake 가 dedup 에 안 삼켜진다.
              parameters=[{'active': yolo_active_start,
-                          'num_threads': 1}],
+                          'num_threads': 1,
+                          # debug 오버레이(/yolo/image/debug)는 monitor 켤 때만 생성(주행 중 불필요).
+                          'debug_image': ParameterValue(monitor, value_type=bool)}],
              condition=IfCondition(yolo)),
 
         # --- ArUco marker detection (only with aruco:=true) ---
         # 카메라 원본을 직접 구독하는 독립 인지 브랜치. /detected_marker_id + /aruco_stop
         # + /aruco/image/debug 발행. interpret 가 /aruco_stop 을 구독해 정지에 반영한다.
         Node(package='aruco', executable='aruco_node', name='aruco_node',
-             output='screen', condition=IfCondition(aruco)),
-
-        # --- Blue-sign trigger (only with bluesign:=true) ---
-        # opencv 의 파란 마스크(/opencv/image/blue)를 구독하는 값싼 캐스케이드 게이트.
-        # 상단 ROI 파란비율을 디바운스해 /sign/near(Bool) 발행 + /bluesign/image/debug 오버레이.
-        # interpret 이 /sign/near 를 받아 갈림길 근처에서 YOLO 전원을 켠다(색 기반 YOLO 깨우기).
-        Node(package='bluesign', executable='bluesign_node', name='bluesign_node',
-             output='screen', parameters=[BLUESIGN_PARAMS],
-             condition=IfCondition(bluesign)),
+             output='screen',
+             # 전원 게이트: idle(active=False)로 뜬다. interpret 가 방향표지(YOLO left/right_sign)
+             # 근접 래치 시 /aruco/active=true 를 발행하면 그때 검출 시작(12시 마커 구간). CPU 확보.
+             parameters=[{'active': False,
+                          # debug 오버레이(/aruco/image/debug)는 monitor 켤 때만 생성.
+                          'debug_image': ParameterValue(monitor, value_type=bool)}],
+             condition=IfCondition(aruco)),
 
         # --- Actuator driver (only with drive:=true) ---
         Node(package='control', executable='control_node', name='control_node',
